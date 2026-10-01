@@ -41,15 +41,16 @@
 
     const loc = await Location.get();          // never fails; nulls if no GPS
     const payload = Api.buildPayload(status, loc);
-    console.log("[SafeSignal] POST", payload);
+    console.log("Sending SafeSignal event...");
+    console.log(JSON.stringify(payload, null, 2));
     const m = MESSAGES[status];
     showFeedback(m.cls, "Sending…", "", "", 10000);
 
     const sent = await Api.send(payload);
     if (sent) {
-      showFeedback(m.cls, m.title, m.l1, "Sent ✓", 2500);
+      showFeedback(m.cls, m.title, m.l1, "Caregiver updated ✓", 2500);
     } else {
-      showFeedback("fail", "Unable to send", "Trying again…", "", 2500);
+      showFeedback("fail", "Connection failed — retrying", "", "", 2500);
     }
     updateQueueInfo();
     updateConnection();

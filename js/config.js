@@ -1,5 +1,5 @@
 // API ENDPOINT + DEVICE SETTINGS – edit this file to connect to Base44.
-const API_ENDPOINT = "PASTE_BASE44_ENDPOINT_HERE";
+const API_ENDPOINT = "https://3000-6abdd8a669e071e439539a84--b-a050b1a-8aa3351f348d1a7d.imported.base44-preview.app/api/status";
 
 const CONFIG = {
   API_ENDPOINT,
