@@ -50,7 +50,7 @@
     if (sent) {
       showFeedback(m.cls, m.title, m.l1, "Caregiver updated ✓", 2500);
     } else {
-      showFeedback("fail", "Connection failed — retrying", "", "", 2500);
+      showFeedback("fail", "Unable to send — retrying", "", "", 2500);
     }
     updateQueueInfo();
     updateConnection();

@@ -32,12 +32,15 @@ const Api = {
     const ctrl = new AbortController();
     const t = setTimeout(() => ctrl.abort(), CONFIG.REQUEST_TIMEOUT_MS);
     try {
+      console.log("[SafeSignal] REQUEST POST " + CONFIG.API_ENDPOINT, payload);
       const res = await fetch(CONFIG.API_ENDPOINT, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...CONFIG.EXTRA_HEADERS },
         body: JSON.stringify(payload),
         signal: ctrl.signal,
       });
+      const text = await res.text().catch(() => "");
+      console.log("[SafeSignal] RESPONSE " + res.status + " " + res.statusText, text);
       if (!res.ok) throw new Error("HTTP " + res.status);
       return true;
     } finally { clearTimeout(t); }
