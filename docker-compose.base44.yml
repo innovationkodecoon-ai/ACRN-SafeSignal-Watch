@@ -1,0 +1,18 @@
+services:
+  web:
+    image: node:22-alpine
+    working_dir: /app
+    volumes:
+      - ./:/app
+    environment:
+      - PORT=3000
+    command: ["node", "--watch", "tools/mock-server.js"]
+    ports:
+      - "3000:3000"
+    restart: on-failure
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/ || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
