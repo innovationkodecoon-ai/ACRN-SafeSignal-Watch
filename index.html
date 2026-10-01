@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>SafeSignal Watch</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <main class="watch">
+    <header>
+      <h1>SafeSignal</h1>
+      <p class="subtitle">Tap how you feel</p>
+      <p id="connection" class="connection offline">🔴 Offline</p>
+    </header>
+
+    <!-- Main screen: three big stacked buttons -->
+    <section id="buttons" class="buttons">
+      <button id="btn-ok"   class="big ok"   data-status="OK">😊 I'M OK</button>
+      <button id="btn-lost" class="big lost" data-status="LOST">📍 I'M LOST</button>
+      <button id="btn-help" class="big help" data-status="HELP">⚠️ HELP</button>
+    </section>
+
+    <!-- Confirmation overlay (shown after a press) -->
+    <section id="feedback" class="feedback hidden" aria-live="polite">
+      <div id="fb-title" class="fb-title"></div>
+      <div id="fb-line1" class="fb-line"></div>
+      <div id="fb-line2" class="fb-line"></div>
+    </section>
+
+    <footer>
+      <span id="battery">Battery: --</span>
+      <button id="test-toggle" class="link">Test</button>
+    </footer>
+
+    <!-- Development / test mode panel -->
+    <section id="test-panel" class="test-panel hidden">
+      <label><input type="checkbox" id="test-enabled"> Use fake coordinates</label>
+      <label>Lat <input type="number" step="any" id="test-lat" value="1.3521"></label>
+      <label>Lng <input type="number" step="any" id="test-lng" value="103.8198"></label>
+      <div id="queue-info" class="queue-info"></div>
+    </section>
+  </main>
+
+  <script src="js/config.js"></script>
+  <script src="js/location.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
