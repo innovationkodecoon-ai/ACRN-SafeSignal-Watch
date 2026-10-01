@@ -1,5 +1,5 @@
 // API ENDPOINT + DEVICE SETTINGS – edit this file to connect to Base44.
-const API_ENDPOINT = "https://safe-signal-copy-665397ac.base44.app/functions/watchStatus";
+const API_ENDPOINT = "https://safesignal-caregiver-to-watch.base44.app/functions/watchStatus";
 
 const CONFIG = {
   API_ENDPOINT,
