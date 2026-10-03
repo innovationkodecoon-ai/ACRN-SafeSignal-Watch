@@ -30,12 +30,20 @@ h1 { font-size: clamp(20px, 7vmin, 40px); }
 .fb-title { font-size: clamp(28px, 11vmin, 64px); font-weight: 900; }
 .fb-line  { font-size: clamp(18px, 6.5vmin, 36px); font-weight: 700; margin-top: 1.5vmin; }
 
-footer { display: flex; justify-content: space-between; align-items: center;
-  font-size: clamp(11px, 3.2vmin, 18px); color: #ccc; padding-top: 1vmin; }
+footer { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 2px 8px;
+  font-size: clamp(10px, 2.9vmin, 16px); color: #ccc; padding-top: 1vmin; }
+.dot { display: inline-block; width: .8em; height: .8em; border-radius: 50%; background: #777; vertical-align: -1px; }
+.dot.online { background: #2ecc40; }
+.dot.offline { background: #ff3b30; }
+.feedback.ack { background: #1769c9; }
 .link { background: none; border: 0; color: #8cf; font-size: inherit; text-decoration: underline; padding: 6px; }
 
-.test-panel { position: absolute; left: 0; right: 0; bottom: 0; background: #222; padding: 10px;
-  font-size: 14px; display: flex; flex-direction: column; gap: 6px; z-index: 6; }
-.test-panel input[type=number] { width: 8em; font-size: 14px; }
+.test-panel { position: absolute; left: 0; right: 0; bottom: 0; max-height: 80%; overflow-y: auto;
+  background: #222; padding: 8px; font-size: 13px; display: flex; flex-direction: column; gap: 5px; z-index: 6; }
+.dev-head { display: flex; justify-content: space-between; align-items: center; }
+.dev-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.dev-grid button { font-size: 12px; padding: 6px 2px; border-radius: 6px; border: 0; background: #444; color: #fff; }
+.dev-log { font-size: 11px; color: #9f9; white-space: pre-wrap; min-height: 3em; }
+.test-panel input[type=number] { width: 6em; font-size: 13px; }
 .queue-info { color: #fc6; }
 .hidden { display: none !important; }

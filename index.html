@@ -9,7 +9,7 @@
 <body>
   <main class="watch">
     <header>
-      <h1>SafeSignal</h1>
+      <h1 id="title">SafeSignal</h1>
       <p class="subtitle">Tap how you feel</p>
       <p id="connection" class="connection offline">🔴 Offline</p>
     </header>
@@ -28,23 +28,40 @@
       <div id="fb-line2" class="fb-line"></div>
     </section>
 
+    <!-- Small system-status area -->
     <footer>
-      <span id="battery">Battery: --</span>
-      <button id="test-toggle" class="link">Test</button>
+      <span id="battery">Battery: n/a</span>
+      <span id="gps">GPS: …</span>
+      <span>Connection: <i id="conn-dot" class="dot"></i></span>
     </footer>
 
-    <!-- Development / test mode panel -->
+    <!-- Hidden development / test panel: open with ?dev=1, ?test=1 or 5 taps on the title -->
     <section id="test-panel" class="test-panel hidden">
+      <div class="dev-head"><b>Dev panel</b><button id="dev-close" class="link">✕ close</button></div>
       <label><input type="checkbox" id="test-enabled"> Use fake coordinates</label>
-      <label>Lat <input type="number" step="any" id="test-lat" value="1.3521"></label>
-      <label>Lng <input type="number" step="any" id="test-lng" value="103.8198"></label>
+      <label>Lat <input type="number" step="any" id="test-lat" value="1.3521">
+             Lng <input type="number" step="any" id="test-lng" value="103.8198"></label>
+      <div class="dev-grid">
+        <button id="sim-battery-low">🔋 Battery 18%</button>
+        <button id="sim-battery-ok">🔋 Battery 78%</button>
+        <button id="sim-gps-lost">📡 GPS lost</button>
+        <button id="sim-gps-ok">📡 GPS restored</button>
+        <button id="sim-offline">✈ Internet off</button>
+        <button id="sim-online">✈ Internet on</button>
+        <button id="sim-ack-safe">Ack: safe</button>
+        <button id="sim-ack-way">Ack: on my way</button>
+        <button id="sim-ack-nearby">Ack: nearby help</button>
+        <button id="sim-reset">Reset all</button>
+      </div>
       <div id="queue-info" class="queue-info"></div>
+      <pre id="dev-log" class="dev-log"></pre>
     </section>
   </main>
 
   <script src="js/config.js"></script>
   <script src="js/location.js"></script>
   <script src="js/api.js"></script>
+  <script src="js/monitor.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>
