@@ -27,6 +27,8 @@
  *   b = battery 18%     B = battery 78%     g = GPS lost     G = GPS restored
  *   o = internet off    O = internet on     1/2/3 = show caregiver acks (safe / on my way / nearby help)
  *   r = reset all simulations     p = fake "paired" reply     u = unpair
+ *   t = SERVER TEST: sends the same PAIR_REQUEST as the curl test (deviceId test-1, code 123456) and prints
+ *       the HTTP code + reply. Expected: 200 {"ok":true,"paired":false}. "user-exception" = the Base44 function crashed.
  *
  * FILE LAYOUT
  *   1. CONFIG ........ endpoint, IDs, timings, Wi-Fi, location source
@@ -179,6 +181,7 @@ static String gDeviceToken;                // sent as X-Device-Token once paired
 static char gPairCode[12] = "000000";
 static uint32_t gPairCodeAt = 0;
 static volatile bool gPairBusy = false;
+static volatile int gPairHttp = 0;         // last HTTP status from the pairing poll (0 = no connection)
 
 static String timestampNow() {
   time_t t = time(nullptr);
@@ -484,8 +487,11 @@ static void pairPoll() {
                 String(gPairCode) + "\",\"timestamp\":\"" + timestampNow() + "\"}";
   int code; String resp;
   bool reached = doPost(body, code, resp);
+  gPairHttp = reached ? code : 0;
   if (!reached) { if (gOnline == 1) setOnline(false); return; }
   setOnline(true);
+  static int lastLoggedCode = -1;
+  if (code != lastLoggedCode) { lastLoggedCode = code; Serial.printf("[SafeSignal] pairing server replied %d: %s\n", code, resp.substring(0, 200).c_str()); }
   if (code == 409) { newPairCode(); return; }                       // someone else has this code: pick another
   if (code < 200 || code >= 300) { Serial.printf("[SafeSignal] pairing -> %d %s\n", code, resp.substring(0, 120).c_str()); return; }
   if (!jsonHasTrue(resp, "paired")) return;
@@ -496,6 +502,19 @@ static void pairPoll() {
   savePairing();
   Serial.printf("[SafeSignal] PAIRED with child %s (%s)\n", gChildId.c_str(), gChildName.c_str());
   pushUi(UE_PAIRED);
+}
+
+// Same request as the curl test. Run it from the Serial Monitor with the letter t.
+static void serverTest() {
+  String body = "{\"eventType\":\"PAIR_REQUEST\",\"deviceId\":\"test-1\",\"pairingCode\":\"123456\"}";
+  int code; String resp;
+  Serial.printf("[SafeSignal] SERVER TEST -> POST %s\n", API_ENDPOINT);
+  bool reached = doPost(body, code, resp);
+  if (!reached) { Serial.println("[SafeSignal] SERVER TEST: no connection (check Wi-Fi / URL)"); return; }
+  Serial.printf("[SafeSignal] SERVER TEST: HTTP %d  reply: %s\n", code, resp.c_str());
+  if (code == 200 && resp.indexOf("\"ok\":true") >= 0) Serial.println("[SafeSignal] SERVER TEST: OK - Base44 accepted it");
+  else if (resp.indexOf("user-exception") >= 0) Serial.println("[SafeSignal] SERVER TEST: Base44 function crashed (user-exception) - the app behind this URL has old/broken watchStatus code");
+  else Serial.println("[SafeSignal] SERVER TEST: Base44 answered but not as expected - see the reply above");
 }
 
 static uint32_t gPressSeq = 0;                       // seq of the status event the child just sent
@@ -693,6 +712,11 @@ static void drawPairing() {
   if (left < 0) left = 0;
   char t[24]; snprintf(t, sizeof(t), "Code valid %d:%02d", left / 60, left % 60);
   textCentered(t, 244, COL_LGREY, 16);
+  char sv[24];                                           // plain-language server status for the helper
+  if (gPairHttp == 0) snprintf(sv, sizeof(sv), "Server: no link");
+  else if (gPairHttp >= 200 && gPairHttp < 300) snprintf(sv, sizeof(sv), "Server: OK");
+  else snprintf(sv, sizeof(sv), "Server error %d", gPairHttp);
+  textCentered(sv, 268, (gPairHttp >= 200 && gPairHttp < 300) ? COL_CONN : COL_OFF, 16);
   hal_text("A:new code  B:skip", 14, 296, COL_LGREY, 16);
   hal_present();
 }
@@ -765,6 +789,7 @@ static void devCommands() {
       case '1': pushUi(UE_ACK, 1); break;
       case '2': pushUi(UE_ACK, 2); break;
       case '3': pushUi(UE_ACK, 3); break;
+      case 't': serverTest(); break;
       case 'p': gChildId = "child_demo"; gChildName = "Demo"; gDeviceToken = "demo-token"; gPaired = true; savePairing(); pushUi(UE_PAIRED); break;
       case 'u': clearPairing(); newPairCode(); gMode = MODE_PAIRING; gDirty = true; Serial.println("DEV: unpaired"); break;
       case 'r': SIM.battery = -1; SIM.gpsLost = false; SIM.offline = false; Serial.println("DEV: reset simulations"); break;
@@ -802,7 +827,7 @@ void setup() {
   xTaskCreatePinnedToCore(networkTask, "net", 12288, nullptr, 1, nullptr, 0);
 
   Serial.printf("[SafeSignal] K10 watch running. Endpoint: %s\n", API_ENDPOINT);
-  Serial.println("DEV keys: b/B battery, g/G gps, o/O internet, 1/2/3 acks, r reset");
+  Serial.println("DEV keys: b/B battery, g/G gps, o/O internet, 1/2/3 acks, r reset, t server test");
   evalBattery();
 }
 

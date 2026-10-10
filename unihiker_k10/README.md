@@ -38,3 +38,6 @@ Single sketch: `safesignal_k10/safesignal_k10.ino` (port of the Python UniHiker 
 3. The watch shows "Paired", stores the child id + private token in flash, and from then on sends every event for that child with header `X-Device-Token`.
 4. To pair again: hold **A + B for 3 seconds**. Serial test keys: `p` fake pairing, `u` unpair.
 Wire format: watch → `{"eventType":"PAIR_REQUEST","deviceId":"safesignal_k10_001","pairingCode":"482913"}` every 3 s; Base44 answers `{"paired":true,"childId":"…","childName":"…","deviceToken":"…"}` once linked. `DEVICE_ID` is now `safesignal_k10_001` (must be unique per watch).
+
+## Server test (same as the curl command)
+Serial Monitor: type `t`. It POSTs `{"eventType":"PAIR_REQUEST","deviceId":"test-1","pairingCode":"123456"}` to `API_ENDPOINT` and prints the HTTP code and reply. Expected `200 {"ok":true,"paired":false}`. `user-exception` means the Base44 function behind the URL crashed (old/missing watchStatus code). The pairing screen also shows "Server: OK" / "Server error 500" / "Server: no link".
