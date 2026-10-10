@@ -31,3 +31,10 @@ Single sketch: `safesignal_k10/safesignal_k10.ino` (port of the Python UniHiker 
 - `hal_batteryPercent()` returns -1 (n/a) until you plug in the K10 battery-capacity call; LOW_BATTERY is never sent while it is n/a.
 - TLS certificate checking is off (`TLS_INSECURE`) for the prototype.
 - Payloads and events are identical to the web version; Base44 needs no changes.
+
+## Pairing with the Base44 caregiver app
+1. A new/unpaired watch shows a **6-digit code** (valid 10 min; **A** = new code, **B** = skip).
+2. In the caregiver app: child profile → **Link a watch** → type the code → Link.
+3. The watch shows "Paired", stores the child id + private token in flash, and from then on sends every event for that child with header `X-Device-Token`.
+4. To pair again: hold **A + B for 3 seconds**. Serial test keys: `p` fake pairing, `u` unpair.
+Wire format: watch → `{"eventType":"PAIR_REQUEST","deviceId":"safesignal_k10_001","pairingCode":"482913"}` every 3 s; Base44 answers `{"paired":true,"childId":"…","childName":"…","deviceToken":"…"}` once linked. `DEVICE_ID` is now `safesignal_k10_001` (must be unique per watch).

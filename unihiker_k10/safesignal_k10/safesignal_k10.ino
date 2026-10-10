@@ -13,6 +13,12 @@
  *   Button A = move the highlight  OK -> LOST -> HELP -> OK ...   (highlight = white frame + "> LABEL <")
  *   Button B = SEND the highlighted choice
  *
+ * PAIRING WITH THE CAREGIVER APP:
+ *   A new watch shows a 6-digit PAIRING CODE. In the Base44 caregiver app open the child's profile ->
+ *   "Link a watch" and type the code. The watch then shows "Paired" and from then on all events are
+ *   sent for that child with a private device token (header X-Device-Token).
+ *   Pairing screen: A = new code, B = skip for now.  To pair again later: hold A + B for 3 seconds.
+ *
  * Arduino IDE setup:
  *   1. Add the DFRobot UNIHIKER board package (Boards Manager -> "UNIHIKER"), select board "UNIHIKER K10".
  *   2. Fill in WIFI_SSID / WIFI_PASSWORD below, then Upload. Open Serial Monitor at 115200 baud.
@@ -20,7 +26,7 @@
  * Dev/test commands (type a letter in the Serial Monitor, no hardware needed):
  *   b = battery 18%     B = battery 78%     g = GPS lost     G = GPS restored
  *   o = internet off    O = internet on     1/2/3 = show caregiver acks (safe / on my way / nearby help)
- *   r = reset all simulations
+ *   r = reset all simulations     p = fake "paired" reply     u = unpair
  *
  * FILE LAYOUT
  *   1. CONFIG ........ endpoint, IDs, timings, Wi-Fi, location source
@@ -44,8 +50,9 @@ static const char *WIFI_SSID     = "YOUR_WIFI_NAME";
 static const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 
 static const char *API_ENDPOINT = "https://safesignal-caregiver-to-watch-acrn.base44.app/functions/watchStatus";
+// CHILD_ID is only the default before pairing; after pairing the child id comes from the caregiver app.
 static const char *CHILD_ID     = "child_001";
-static const char *DEVICE_ID    = "safesignal_watch_001";
+static const char *DEVICE_ID    = "safesignal_k10_001";   // unique per watch
 // Extra header if Base44 needs one (leave EXTRA_HEADER_NAME empty for none), e.g. "api_key" / "xxxx"
 static const char *EXTRA_HEADER_NAME  = "";
 static const char *EXTRA_HEADER_VALUE = "";
@@ -63,6 +70,9 @@ static const uint32_t GPS_CHECK_MS        = 5000;   // how often location is sam
 static const uint32_t GPS_LOSS_MS         = 30000;  // no valid location for this long => GPS_LOST
 static const uint32_t REQUEST_TIMEOUT_MS  = 8000;
 static const uint32_t WIFI_RETRY_MS       = 8000;
+static const uint32_t PAIR_POLL_MS        = 3000;   // while pairing: tell Base44 our code / ask if linked
+static const uint32_t PAIR_CODE_LIFE_MS   = 600000; // code expires after 10 minutes (a new one is made)
+static const uint32_t UNPAIR_HOLD_MS      = 3000;   // hold A+B this long to pair again
 
 // Time zone for timestamps (Singapore = UTC+8). Time comes from NTP once Wi-Fi is up.
 static const int TZ_OFFSET_MIN = 8 * 60;
@@ -159,6 +169,17 @@ static volatile int8_t gGpsOk  = -1;       // -1 unknown, 0 lost, 1 ok
 static volatile int    gBattery = -1;      // percent or -1 (n/a)
 static String gOfflineSince;
 
+// ---- pairing ----
+enum Mode { MODE_PAIRING, MODE_MAIN };
+static Mode gMode = MODE_MAIN;
+static bool gPaired = false;
+static String gChildId;                    // set in setup() (CHILD_ID or the paired child)
+static String gChildName;
+static String gDeviceToken;                // sent as X-Device-Token once paired
+static char gPairCode[12] = "000000";
+static uint32_t gPairCodeAt = 0;
+static volatile bool gPairBusy = false;
+
 static String timestampNow() {
   time_t t = time(nullptr);
   struct tm tmv;
@@ -254,7 +275,7 @@ static Fix getFix() {
 static String jnum(bool ok, double v) { return ok ? String(v, 6) : String("null"); }
 
 static String buildStatusPayload(const char *status, const Fix &f) {
-  String s = "{\"childId\":\""; s += CHILD_ID;
+  String s = "{\"childId\":\""; s += gChildId;
   s += "\",\"deviceId\":\""; s += DEVICE_ID;
   s += "\",\"status\":\""; s += status;
   s += "\",\"latitude\":"; s += jnum(f.ok, f.lat);
@@ -265,7 +286,7 @@ static String buildStatusPayload(const char *status, const Fix &f) {
 
 // extra = already-formatted fields starting with a comma, e.g. ",\"batteryLevel\":18"
 static String buildEventPayload(const char *eventType, const String &extra) {
-  String s = "{\"childId\":\""; s += CHILD_ID;
+  String s = "{\"childId\":\""; s += gChildId;
   s += "\",\"deviceId\":\""; s += DEVICE_ID;
   s += "\",\"eventType\":\""; s += eventType; s += "\"";
   s += extra;
@@ -286,7 +307,7 @@ static volatile bool gKick = false;                 // try to send right away
 static volatile bool gConnRestoredPending = false;
 
 // UI notifications from the network task
-enum UiEvt { UE_PRESS_SENT, UE_PRESS_FAILED, UE_DELIVERED_LATER, UE_ACK };
+enum UiEvt { UE_PRESS_SENT, UE_PRESS_FAILED, UE_DELIVERED_LATER, UE_ACK, UE_PAIRED };
 struct UiMsg { UiEvt type; int arg; };
 static UiMsg gUiQ[8];
 static int gUiHead = 0, gUiTail = 0;
@@ -395,6 +416,7 @@ static bool doPost(const String &body, int &code, String &resp) {
   if (!http.begin(client, API_ENDPOINT)) return false;
   http.addHeader("Content-Type", "application/json");
   if (EXTRA_HEADER_NAME[0]) http.addHeader(EXTRA_HEADER_NAME, EXTRA_HEADER_VALUE);
+  if (gDeviceToken.length()) http.addHeader("X-Device-Token", gDeviceToken.c_str());   // proves this is the paired watch
   code = http.POST(body);
   if (code <= 0) { http.end(); code = 0; return false; }
   resp = http.getString();
@@ -419,6 +441,61 @@ static SendResult sendPayload(const String &payload, int slot, bool quiet) {
   if (code >= 200 && code < 300) { handleAck(resp); return R_SENT; }
   if (slot >= 0 && (slot == SLOT_STATUS || code >= 500 || code == 408 || code == 429)) return R_QUEUED;
   return R_DROPPED;
+}
+
+// ---- pairing: new code, save/clear, poll Base44 ----
+static void newPairCode() {
+  uint32_t r = (uint32_t)random(1000000);
+  snprintf(gPairCode, sizeof(gPairCode), "%06lu", (unsigned long)r);
+  gPairCodeAt = millis();
+  Serial.printf("[SafeSignal] pairing code: %s\n", gPairCode);
+}
+
+static void savePairing() {
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  prefs.putBool("paired", true);
+  prefs.putString("childId", gChildId);
+  prefs.putString("childName", gChildName);
+  prefs.putString("token", gDeviceToken);
+  xSemaphoreGive(gMutex);
+}
+
+static void clearPairing() {
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  prefs.putBool("paired", false);
+  prefs.remove("childId"); prefs.remove("childName"); prefs.remove("token");
+  xSemaphoreGive(gMutex);
+  gPaired = false; gChildId = CHILD_ID; gChildName = ""; gDeviceToken = "";
+}
+
+// Reply from Base44: {"paired":true,"childId":"...","childName":"Alex","deviceToken":"..."}
+static bool jsonHasTrue(const String &body, const char *key) {
+  int i = body.indexOf(String("\"") + key + "\"");
+  if (i < 0) return false;
+  i = body.indexOf(':', i);
+  if (i < 0) return false;
+  while (++i < (int)body.length() && (body[i] == ' ' || body[i] == '\t' || body[i] == '\n')) {}
+  return body.substring(i, i + 4) == "true";
+}
+
+// Called every PAIR_POLL_MS while the pairing screen is up: registers our code and checks if the caregiver linked us.
+static void pairPoll() {
+  String body = "{\"deviceId\":\"" + String(DEVICE_ID) + "\",\"eventType\":\"PAIR_REQUEST\",\"pairingCode\":\"" +
+                String(gPairCode) + "\",\"timestamp\":\"" + timestampNow() + "\"}";
+  int code; String resp;
+  bool reached = doPost(body, code, resp);
+  if (!reached) { if (gOnline == 1) setOnline(false); return; }
+  setOnline(true);
+  if (code == 409) { newPairCode(); return; }                       // someone else has this code: pick another
+  if (code < 200 || code >= 300) { Serial.printf("[SafeSignal] pairing -> %d %s\n", code, resp.substring(0, 120).c_str()); return; }
+  if (!jsonHasTrue(resp, "paired")) return;
+  String cid = jsonGetString(resp, "childId"), tok = jsonGetString(resp, "deviceToken");
+  if (cid == "" || tok == "") return;
+  gChildId = cid; gDeviceToken = tok; gChildName = jsonGetString(resp, "childName");
+  gPaired = true;
+  savePairing();
+  Serial.printf("[SafeSignal] PAIRED with child %s (%s)\n", gChildId.c_str(), gChildName.c_str());
+  pushUi(UE_PAIRED);
 }
 
 static uint32_t gPressSeq = 0;                       // seq of the status event the child just sent
@@ -451,7 +528,7 @@ static void flushOutbox() {
 }
 
 static void networkTask(void *) {
-  uint32_t lastHb = 0, lastTry = 0, lastWifi = 0, lastRestored = 0;
+  uint32_t lastHb = 0, lastTry = 0, lastWifi = 0, lastRestored = 0, lastPair = 0;
   bool ntpStarted = false;
   for (;;) {
     uint32_t now = millis();
@@ -469,6 +546,12 @@ static void networkTask(void *) {
     } else if (!ntpStarted) {
       ntpStarted = true;
       configTime(TZ_OFFSET_MIN * 60, 0, "pool.ntp.org", "time.google.com");
+    }
+
+    // Pairing screen: register our code with Base44 and wait for the caregiver to link it
+    if (gMode == MODE_PAIRING && !gPaired && now - lastPair >= PAIR_POLL_MS) {
+      lastPair = now;
+      pairPoll();
     }
 
     // Queued events: right away when new, otherwise every RETRY_INTERVAL_MS
@@ -592,6 +675,28 @@ static void drawMain() {
   hal_present();
 }
 
+static void drawPairing() {
+  hal_clear();
+  textCentered("SafeSignal", 4, COL_WHITE, 24);
+  textCentered("Pair with caregiver", 34, COL_LGREY, 16);
+  textCentered(gOnline == 1 ? "Waiting for caregiver..." : "Connecting...", 54, gOnline == 1 ? COL_CONN : COL_OFF, 16);
+
+  hal_rect(8, 82, SCREEN_W - 16, 70, COL_BLUE);
+  char spaced[16];                                       // "482 913" with extra spacing
+  snprintf(spaced, sizeof(spaced), "%c %c %c   %c %c %c", gPairCode[0], gPairCode[1], gPairCode[2], gPairCode[3], gPairCode[4], gPairCode[5]);
+  textCentered(spaced, 106, COL_WHITE, 24);
+
+  textCentered("In the caregiver app:", 168, COL_LGREY, 16);
+  textCentered("Child > Link a watch", 190, COL_WHITE, 16);
+  textCentered("and type this code", 212, COL_WHITE, 16);
+  int left = (int)((PAIR_CODE_LIFE_MS - (millis() - gPairCodeAt)) / 1000);
+  if (left < 0) left = 0;
+  char t[24]; snprintf(t, sizeof(t), "Code valid %d:%02d", left / 60, left % 60);
+  textCentered(t, 244, COL_LGREY, 16);
+  hal_text("A:new code  B:skip", 14, 296, COL_LGREY, 16);
+  hal_present();
+}
+
 static void drawOverlay() {
   hal_clear();
   hal_rect(0, 0, SCREEN_W, SCREEN_H, gOverlayColor);
@@ -631,6 +736,10 @@ static void handleUiEvents() {
       case UE_DELIVERED_LATER:
         showOverlay(COL_GREEN, "Caregiver updated", "", "", 2500);
         break;
+      case UE_PAIRED:
+        gMode = MODE_MAIN;
+        showOverlay(COL_GREEN, "Paired", gChildName.length() ? "Linked to " + gChildName : String("Linked to caregiver"), "", 3500);
+        break;
       case UE_ACK:
         if (m.arg == 1)      showOverlay(COL_BLUE, "You're safe", "Caregiver says OK", "", 6000);
         else if (m.arg == 2) showOverlay(COL_BLUE, "Help is coming", "Caregiver is on the way", "", 6000);
@@ -656,6 +765,8 @@ static void devCommands() {
       case '1': pushUi(UE_ACK, 1); break;
       case '2': pushUi(UE_ACK, 2); break;
       case '3': pushUi(UE_ACK, 3); break;
+      case 'p': gChildId = "child_demo"; gChildName = "Demo"; gDeviceToken = "demo-token"; gPaired = true; savePairing(); pushUi(UE_PAIRED); break;
+      case 'u': clearPairing(); newPairCode(); gMode = MODE_PAIRING; gDirty = true; Serial.println("DEV: unpaired"); break;
       case 'r': SIM.battery = -1; SIM.gpsLost = false; SIM.offline = false; Serial.println("DEV: reset simulations"); break;
       default: break;
     }
@@ -666,6 +777,7 @@ static void devCommands() {
 // 11. setup() / loop()
 // =====================================================================
 static bool gPrevA = false, gPrevB = false;
+static uint32_t gBothSince = 0, gLastPairDraw = 0;
 static int8_t gDrawnOnline = -2, gDrawnGps = -2; static int gDrawnBatt = -2;
 
 void setup() {
@@ -675,6 +787,11 @@ void setup() {
   gHaveLastKnown = prefs.isKey("lkLat");
   if (gHaveLastKnown) { gLastLat = prefs.getDouble("lkLat", 0); gLastLng = prefs.getDouble("lkLng", 0); gSavedLat = gLastLat; gSavedLng = gLastLng; }
   loadQueueFromFlash();                                // unsent events survive a reboot
+  gPaired = prefs.getBool("paired", false);
+  gChildId = gPaired ? prefs.getString("childId", CHILD_ID) : String(CHILD_ID);
+  gChildName = prefs.getString("childName", "");
+  gDeviceToken = gPaired ? prefs.getString("token", "") : String("");
+  if (!gPaired) { newPairCode(); gMode = MODE_PAIRING; }   // new watch: show the pairing code first
 
   hal_init();
   if (LOCATION_SOURCE == LOC_SERIAL_NMEA) Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -698,10 +815,20 @@ void loop() {
 
   // Buttons (act on the press edge)
   bool a = hal_buttonA(), b = hal_buttonB();
-  if (a && !gPrevA && !gOverlay) { gSel = (gSel + 1) % 3; gDirty = true; }
-  if (b && !gPrevB) {
-    if (gOverlay && !gAwaitingPress) gOverlayUntil = 0;            // B dismisses a message
-    else pressChoice(gSel);
+  if (gMode == MODE_PAIRING) {
+    if (a && !gPrevA && !gOverlay) { newPairCode(); gDirty = true; }            // A = new code
+    if (b && !gPrevB && !gOverlay) { gMode = MODE_MAIN; gDirty = true; }        // B = skip for now
+    if (now - gLastPairDraw >= 1000) { gLastPairDraw = now; if (!gOverlay) gDirty = true; }   // countdown
+    if (millis() - gPairCodeAt > PAIR_CODE_LIFE_MS) { newPairCode(); gDirty = true; }
+  } else {
+    if (a && !gPrevA && !gOverlay) { gSel = (gSel + 1) % 3; gDirty = true; }
+    if (b && !gPrevB) {
+      if (gOverlay && !gAwaitingPress) gOverlayUntil = 0;            // B dismisses a message
+      else pressChoice(gSel);
+    }
+    // hold A + B for 3 s = pair again
+    if (a && b) { if (!gBothSince) gBothSince = now ? now : 1; else if (now - gBothSince >= UNPAIR_HOLD_MS) { gBothSince = 0; clearPairing(); newPairCode(); gMode = MODE_PAIRING; gDirty = true; } }
+    else gBothSince = 0;
   }
   gPrevA = a; gPrevB = b;
 
@@ -719,7 +846,7 @@ void loop() {
   }
   if (gDirty) {
     gDirty = false;
-    if (gOverlay) drawOverlay(); else drawMain();
+    if (gOverlay) drawOverlay(); else if (gMode == MODE_PAIRING) drawPairing(); else drawMain();
   }
   delay(20);
 }
