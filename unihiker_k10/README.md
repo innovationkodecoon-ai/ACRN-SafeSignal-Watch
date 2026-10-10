@@ -8,7 +8,7 @@ Single sketch: `safesignal_k10/safesignal_k10.ino` (port of the Python UniHiker 
 3. Upload, open Serial Monitor at 115200.
 
 ## Controls (K10 has buttons A / B)
-- **A** = move highlight OK → LOST → HELP.  **B** = send the highlighted choice (also dismisses a message).
+- **A** = move highlight OK → LOST → HELP (shown as `> LABEL <` with a white frame). **B** = send the highlighted choice (also dismisses a message).
 
 ## Test without hardware conditions (Serial Monitor, type one letter)
 `b` battery 18% · `B` battery 78% · `g` GPS lost · `G` GPS restored · `o` internet off · `O` internet on · `1/2/3` caregiver acks · `r` reset.

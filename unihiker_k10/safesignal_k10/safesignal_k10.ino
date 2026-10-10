@@ -10,7 +10,7 @@
  *   - Caregiver acknowledgements in any response are shown full screen
  *
  * HOW TO USE THE K10 (it has two buttons, A and B - no touch input is used):
- *   Button A = move the highlight  OK -> LOST -> HELP -> OK ...
+ *   Button A = move the highlight  OK -> LOST -> HELP -> OK ...   (highlight = white frame + "> LABEL <")
  *   Button B = SEND the highlighted choice
  *
  * Arduino IDE setup:
@@ -568,7 +568,7 @@ static void showOverlay(uint32_t color, const String &t, const String &l1, const
 static void drawMain() {
   hal_clear();
   textCentered("SafeSignal", 4, COL_WHITE, 24);
-  textCentered("A: next   B: send", 34, COL_LGREY, 16);
+  textCentered("Tap how you feel", 34, COL_LGREY, 16);
   bool on = (gOnline == 1);
   textCentered(on ? "Connected" : "Offline", 54, on ? COL_CONN : COL_OFF, 16);
 
@@ -576,7 +576,9 @@ static void drawMain() {
   for (int i = 0; i < 3; i++) {
     if (i == gSel) hal_rect(2, y - 4, SCREEN_W - 4, h + 8, COL_WHITE);       // selection frame
     hal_rect(8, y, SCREEN_W - 16, h, CHOICES[i].color);
-    textCentered(CHOICES[i].label, y + (h - 24) / 2, COL_WHITE, 24);
+    // the highlighted choice is shown as "> LABEL <" (A moves it, B sends it)
+    String label = (i == gSel) ? String("> ") + CHOICES[i].label + " <" : String(CHOICES[i].label);
+    textCentered(label.c_str(), y + (h - 24) / 2, COL_WHITE, 24);
     y += h + gap + 4;
   }
 
