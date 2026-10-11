@@ -46,3 +46,8 @@ Serial Monitor: type `t`. It POSTs `{"eventType":"PAIR_REQUEST","deviceId":"test
 - **Device ID:** `SAFESIGNAL-001`  (`DEVICE_ID` in section 1 of the sketch)
 - **Pairing Code:** `482731`  (`FIXED_PAIR_CODE`; set `USE_FIXED_PAIR_CODE=false` for a random code each time)
 Type both into the app form. They are shown on the watch pairing screen and printed in the Serial Monitor. Use a different Device ID/code for each additional watch.
+
+## Low battery + camera (new)
+- **LOW_BATTERY** is sent once when the battery reaches 20% or lower (re-arms above 20%). It needs a battery reading: install DFRobot's `DFRobot_UnihikerExpansion` library (uses `eunihiker.getBattery()`); otherwise the screen shows `Batt:n/a`. Test with Serial key `b`.
+- **Camera:** any button press (OK / LOST / HELP) starts a camera session: photo now, then one every 60 s, uploaded as `CAMERA_IMAGE` (JPEG base64). Stops after 60 min or when Base44 replies `cameraCommand: "STOP"`; `START` / `CAPTURE_NOW` also supported. A red `CAM` marker shows on screen while on. Serial keys: `c` start, `x` stop.
+- The camera calls are in the `hal_camera*` functions (section 2) and were written without the board.

@@ -29,8 +29,18 @@
  *   b = battery 18%     B = battery 78%     g = GPS lost     G = GPS restored
  *   o = internet off    O = internet on     1/2/3 = show caregiver acks (safe / on my way / nearby help)
  *   r = reset all simulations     p = fake "paired" reply     u = unpair
+ *   c = camera session ON now (photo, then every 60 s)     x = camera OFF
  *   t = SERVER TEST: sends the same PAIR_REQUEST as the curl test (deviceId test-1, code 123456) and prints
  *       the HTTP code + reply. Expected: 200 {"ok":true,"paired":false}. "user-exception" = the Base44 function crashed.
+ *
+ * LOW BATTERY: sends LOW_BATTERY to the caregiver app once when the battery reaches 20% or lower
+ *   (re-arms when it goes back above 20%). Needs a battery reading, see hal_batteryPercent() below.
+ *
+ * CAMERA (new): after the child presses I'M OK / I'M LOST / HELP the K10 camera starts: it takes a photo
+ *   straight away and then one every 60 seconds with no more button presses, and uploads each photo to Base44
+ *   as a CAMERA_IMAGE event (JPEG, base64). It stops after CAMERA_MAX_SESSION_MS (default 60 min) or when the
+ *   caregiver app sends cameraCommand STOP. The caregiver app can also answer with cameraCommand START or
+ *   CAPTURE_NOW ("take a photo now"). A red CAM marker on the main screen shows while the camera is on.
  *
  * FILE LAYOUT
  *   1. CONFIG ........ endpoint, IDs, timings, Wi-Fi, location source
@@ -46,6 +56,17 @@
 #include <Preferences.h>
 #include <time.h>
 #include "unihiker_k10.h"
+#include "mbedtls/base64.h"
+#if __has_include("esp_camera.h")
+  #include "esp_camera.h"
+  #include "img_converters.h"
+  #define HAVE_ESP_CAMERA 1
+#endif
+// Battery of the K10 expansion board (18650): install DFRobot's "DFRobot_UnihikerExpansion" library to enable it.
+#if __has_include("DFRobot_UnihikerExpansion.h")
+  #include "DFRobot_UnihikerExpansion.h"
+  #define HAVE_EXPANSION_BATTERY 1
+#endif
 
 // =====================================================================
 // 1. CONFIG  (edit this section)
@@ -71,7 +92,7 @@ static const bool TLS_INSECURE = true;
 static const uint32_t COOLDOWN_MS         = 2500;   // ignore presses for this long after a press
 static const uint32_t RETRY_INTERVAL_MS   = 5000;   // retry unsent events this often
 static const uint32_t HEARTBEAT_MS        = 15000;  // "I'm alive" ping; Base44 flags the watch if several are missed
-static const int      LOW_BATTERY_PERCENT = 20;     // LOW_BATTERY event when level drops below this
+static const int      LOW_BATTERY_PERCENT = 20;     // LOW_BATTERY event when the level reaches this or lower
 static const uint32_t BATTERY_CHECK_MS    = 10000;
 static const uint32_t GPS_CHECK_MS        = 5000;   // how often location is sampled
 static const uint32_t GPS_LOSS_MS         = 30000;  // no valid location for this long => GPS_LOST
@@ -80,6 +101,14 @@ static const uint32_t WIFI_RETRY_MS       = 8000;
 static const uint32_t PAIR_POLL_MS        = 3000;   // while pairing: tell Base44 our code / ask if linked
 static const uint32_t PAIR_CODE_LIFE_MS   = 600000; // code expires after 10 minutes (a new one is made)
 static const uint32_t UNPAIR_HOLD_MS      = 3000;   // hold A+B this long to pair again
+
+// ---- CAMERA ----
+static const bool     CAMERA_ENABLED          = true;      // false = never use the camera
+static const uint32_t CAMERA_INTERVAL_MS      = 60000;     // one photo every 60 s while the camera session is on
+static const uint32_t CAMERA_MAX_SESSION_MS   = 3600000UL; // auto-stop after 60 min (the caregiver can stop it earlier)
+static const int      CAMERA_JPEG_QUALITY     = 15;        // 1-63, LOWER = better quality / bigger file
+static const uint32_t IMAGE_TIMEOUT_MS        = 20000;     // photo upload timeout
+static const int      IMAGE_MAX_TRIES         = 4;         // then the photo is dropped (a newer one replaces it anyway)
 
 // Time zone for timestamps (Singapore = UTC+8). Time comes from NTP once Wi-Fi is up.
 static const int TZ_OFFSET_MIN = 8 * 60;
@@ -135,9 +164,52 @@ static void hal_text(const char *text, int x, int y, uint32_t color, int size) {
 static void hal_present() { k10.canvas->updateCanvas(); }
 static bool hal_buttonA() { return k10.buttonA->isPressed(); }
 static bool hal_buttonB() { return k10.buttonB->isPressed(); }
-// Battery percent 0-100, or -1 if this board/library cannot report it.
-// TODO: replace with the K10 battery-capacity call from DFRobot's "Battery capacity" example.
-static int hal_batteryPercent() { return -1; }
+// Battery percent 0-100, or -1 if no reading is available (then no LOW_BATTERY alert can be sent).
+// Uses the K10 expansion-board battery from DFRobot's "Battery capacity" example (eunihiker.getBattery()).
+// If you read the battery another way, replace the body of this function.
+static int hal_batteryPercent() {
+#ifdef HAVE_EXPANSION_BATTERY
+  static bool started = false;
+  if (!started) { eunihiker.begin(); started = true; }
+  int p = (int)eunihiker.getBattery();
+  return (p >= 0 && p <= 100) ? p : -1;
+#else
+  return -1;
+#endif
+}
+
+// ---- camera (uses the K10 camera through the standard esp32-camera driver) ----
+// !! These calls were written without the board: if they do not compile / no photo appears, only this block needs fixing.
+static void *bigAlloc(size_t n) { void *p = psramFound() ? ps_malloc(n) : nullptr; return p ? p : malloc(n); }
+
+static bool hal_cameraStart() {
+#ifdef HAVE_ESP_CAMERA
+  k10.initBgCamerImage();            // brings up the K10 camera
+  k10.setBgCamerImage(false);        // keep the LCD free for the SafeSignal screen
+  return true;
+#else
+  return false;
+#endif
+}
+static void hal_cameraStop() { /* camera stays initialised; we simply stop capturing */ }
+// Takes one photo. On success *jpg is a bigAlloc'd JPEG (caller frees with free()) and *len its size.
+static bool hal_cameraCapture(uint8_t **jpg, size_t *len) {
+#ifdef HAVE_ESP_CAMERA
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) return false;
+  bool ok = false;
+  if (fb->format == PIXFORMAT_JPEG) {
+    *jpg = (uint8_t *)bigAlloc(fb->len);
+    if (*jpg) { memcpy(*jpg, fb->buf, fb->len); *len = fb->len; ok = true; }
+  } else {
+    ok = frame2jpg(fb, CAMERA_JPEG_QUALITY, jpg, len);       // RGB565 etc. -> JPEG
+  }
+  esp_camera_fb_return(fb);
+  return ok;
+#else
+  return false;
+#endif
+}
 
 // Rough text width so we can centre text (the canvas API only takes the top-left corner).
 static int textW(const char *s, int size) { return (int)strlen(s) * (size >= 24 ? 13 : 9); }
@@ -175,6 +247,7 @@ static volatile int8_t gOnline = -1;       // -1 unknown, 0 offline, 1 online
 static volatile int8_t gGpsOk  = -1;       // -1 unknown, 0 lost, 1 ok
 static volatile int    gBattery = -1;      // percent or -1 (n/a)
 static String gOfflineSince;
+static bool   gDirty = true;               // screen needs redrawing
 
 // ---- pairing ----
 enum Mode { MODE_PAIRING, MODE_MAIN };
@@ -400,7 +473,17 @@ static int ackCode(const String &a) {
   if (a == "NEED_NEARBY_HELP") return 3;
   return 0;
 }
+// Camera commands from the caregiver app, set by the network task and executed in loop():
+//   {"cameraCommand":"START"|"STOP"|"CAPTURE_NOW"} in any response
+enum CamCmd { CAMCMD_NONE = 0, CAMCMD_START = 1, CAMCMD_STOP = 2, CAMCMD_CAPTURE = 3 };
+static volatile int gCamCmd = CAMCMD_NONE;
+
 static void handleAck(const String &body) {
+  String cc = jsonGetString(body, "cameraCommand");
+  if (cc == "START") gCamCmd = CAMCMD_START;
+  else if (cc == "STOP") gCamCmd = CAMCMD_STOP;
+  else if (cc == "CAPTURE_NOW") gCamCmd = CAMCMD_CAPTURE;
+
   String a = jsonGetString(body, "acknowledgement");
   if (a == "") a = jsonGetString(body, "ack");
   int code = ackCode(a);
@@ -411,25 +494,28 @@ static void handleAck(const String &body) {
   pushUi(UE_ACK, code);
 }
 
-// Low-level POST. Returns false if the backend could not be reached (network failure).
+// Low-level POST of raw bytes. Returns false if the backend could not be reached (network failure).
 // Any HTTP answer (even 4xx/5xx) counts as reachable.
-static bool doPost(const String &body, int &code, String &resp) {
+static bool doPostBytes(const uint8_t *data, size_t len, int &code, String &resp, uint32_t timeoutMs) {
   code = 0;
   if (SIM.offline || WiFi.status() != WL_CONNECTED) return false;
   WiFiClientSecure client;
   if (TLS_INSECURE) client.setInsecure();
   HTTPClient http;
-  http.setTimeout(REQUEST_TIMEOUT_MS);
+  http.setTimeout(timeoutMs);
   http.setConnectTimeout(REQUEST_TIMEOUT_MS);
   if (!http.begin(client, API_ENDPOINT)) return false;
   http.addHeader("Content-Type", "application/json");
   if (EXTRA_HEADER_NAME[0]) http.addHeader(EXTRA_HEADER_NAME, EXTRA_HEADER_VALUE);
   if (gDeviceToken.length()) http.addHeader("X-Device-Token", gDeviceToken.c_str());   // proves this is the paired watch
-  code = http.POST(body);
+  code = http.POST((uint8_t *)data, len);
   if (code <= 0) { http.end(); code = 0; return false; }
   resp = http.getString();
   http.end();
   return true;
+}
+static bool doPost(const String &body, int &code, String &resp) {
+  return doPostBytes((const uint8_t *)body.c_str(), body.length(), code, resp, REQUEST_TIMEOUT_MS);
 }
 
 // slot < 0 = never queued (HEARTBEAT, CONNECTIVITY_RESTORED).
@@ -529,6 +615,69 @@ static void serverTest() {
 static uint32_t gPressSeq = 0;                       // seq of the status event the child just sent
 static volatile bool gPressReported = false;
 
+// ---- camera photo hand-over: loop() captures, the network task uploads (only the newest photo is kept) ----
+static uint8_t *gImgBuf = nullptr;
+static size_t   gImgLen = 0;
+static char     gImgTrigger[8] = "AUTO";
+static String   gImgTs;
+static bool     gImgHasLoc = false;
+static double   gImgLat = 0, gImgLng = 0;
+static int      gImgTries = 0;
+static volatile bool gImgPending = false;
+
+static void setPendingImage(uint8_t *jpg, size_t len, const char *trigger) {
+  Fix f = getFix();
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  if (gImgBuf) free(gImgBuf);                      // a newer photo replaces an unsent one
+  gImgBuf = jpg; gImgLen = len; gImgTries = 0;
+  snprintf(gImgTrigger, sizeof(gImgTrigger), "%s", trigger);
+  gImgTs = timestampNow();
+  gImgHasLoc = f.ok; gImgLat = f.lat; gImgLng = f.lng;
+  gImgPending = true;
+  xSemaphoreGive(gMutex);
+  Serial.printf("[SafeSignal] photo ready (%u bytes, trigger %s)\n", (unsigned)len, trigger);
+}
+
+// Upload the pending photo as a CAMERA_IMAGE event (JPEG as base64 inside the JSON).
+static void uploadImage() {
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  uint8_t *jpg = gImgBuf; size_t jlen = gImgLen;
+  gImgBuf = nullptr; gImgPending = false;           // take ownership while we upload
+  String trig = gImgTrigger, ts = gImgTs;
+  bool hasLoc = gImgHasLoc; double lat = gImgLat, lng = gImgLng;
+  int tries = gImgTries;
+  xSemaphoreGive(gMutex);
+  if (!jpg) return;
+
+  String head = "{\"childId\":\"" + gChildId + "\",\"deviceId\":\"" + String(DEVICE_ID) +
+                "\",\"eventType\":\"CAMERA_IMAGE\",\"trigger\":\"" + trig +
+                "\",\"latitude\":" + jnum(hasLoc, lat) + ",\"longitude\":" + jnum(hasLoc, lng) +
+                ",\"timestamp\":\"" + ts + "\",\"imageFormat\":\"jpeg\",\"imageBase64\":\"";
+  size_t b64max = ((jlen + 2) / 3) * 4 + 4;
+  size_t total = head.length() + b64max + 4;
+  char *buf = (char *)bigAlloc(total);
+  if (!buf) { Serial.println("[SafeSignal] photo: out of memory, dropped"); free(jpg); return; }
+  memcpy(buf, head.c_str(), head.length());
+  size_t olen = 0;
+  mbedtls_base64_encode((unsigned char *)buf + head.length(), b64max, &olen, jpg, jlen);
+  size_t n = head.length() + olen;
+  buf[n++] = '"'; buf[n++] = '}';
+
+  int code; String resp;
+  bool reached = doPostBytes((const uint8_t *)buf, n, code, resp, IMAGE_TIMEOUT_MS);
+  free(buf);
+  bool sent = reached && code >= 200 && code < 300;
+  if (reached) { setOnline(true); gLastHttpCode = code; handleAck(resp); }
+  else { gLastHttpCode = 0; if (gOnline == 1) setOnline(false); }
+  Serial.printf("[SafeSignal] photo upload -> %s (HTTP %d)\n", sent ? "OK" : "FAILED", code);
+
+  bool retry = !sent && (!reached || code >= 500 || code == 408 || code == 429) && tries + 1 < IMAGE_MAX_TRIES;
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  if (retry && !gImgBuf) { gImgBuf = jpg; gImgLen = jlen; gImgTries = tries + 1; gImgPending = true; jpg = nullptr; }   // keep for a retry unless a newer photo arrived
+  xSemaphoreGive(gMutex);
+  if (jpg) free(jpg);
+}
+
 // Deliver everything queued, highest priority first.
 static void flushOutbox() {
   for (int i = 0; i < SLOT_COUNT; i++) {
@@ -556,7 +705,7 @@ static void flushOutbox() {
 }
 
 static void networkTask(void *) {
-  uint32_t lastHb = 0, lastTry = 0, lastWifi = 0, lastRestored = 0, lastPair = 0;
+  uint32_t lastHb = 0, lastTry = 0, lastWifi = 0, lastRestored = 0, lastPair = 0, lastImg = 0;
   bool ntpStarted = false;
   for (;;) {
     uint32_t now = millis();
@@ -588,6 +737,12 @@ static void networkTask(void *) {
       flushOutbox();
     }
 
+    // Camera photo waiting? (after status events, before the heartbeat)
+    if (gImgPending && gOnline != 0 && now - lastImg >= 2000) {
+      lastImg = now;
+      uploadImage();
+    }
+
     // Back online: after the queue is delivered, tell Base44 the connection returned
     if (gConnRestoredPending && pendingCount() == 0 && gOnline == 1 && now - lastRestored >= 2000) {
       lastRestored = now;
@@ -600,7 +755,7 @@ static void networkTask(void *) {
     // several missed beats (about 45 s) as "connectivity lost".
     if (now - lastHb >= HEARTBEAT_MS || lastHb == 0) {
       lastHb = now ? now : 1;
-      sendPayload(buildEventPayload("HEARTBEAT", ""), -1, true);
+      sendPayload(buildEventPayload("HEARTBEAT", gBattery >= 0 ? String(",\"batteryLevel\":") + String((int)gBattery) : String("")), -1, true);
     }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
@@ -617,13 +772,13 @@ static void evalBattery() {
   int level = SIM.battery >= 0 ? SIM.battery : hal_batteryPercent();
   gBattery = level;
   if (level < 0) return;                              // not supported -> shows n/a, nothing sent
-  if (level < LOW_BATTERY_PERCENT) {
-    if (!gLowSent) {                                  // only once per dip below the threshold
+  if (level <= LOW_BATTERY_PERCENT) {
+    if (!gLowSent) {                                  // only once when it reaches 20% or lower
       gLowSent = true;
       submit(SLOT_BATT, buildEventPayload("LOW_BATTERY", ",\"batteryLevel\":" + String(level)));
     }
   } else {
-    gLowSent = false;                                 // recovered -> arm for the next dip
+    gLowSent = false;                                 // back above 20% -> arm for the next time
   }
 }
 
@@ -650,6 +805,54 @@ static void gpsTick() {
 }
 
 // =====================================================================
+// 8b. CAMERA SESSION  (started by any button press, then a photo every 60 s)
+// =====================================================================
+static bool     gCamActive = false;
+static uint32_t gCamEndAt = 0, gCamNextAt = 0;
+static char     gCamTrigger[8] = "AUTO";            // trigger label for the NEXT photo (status after a press, then AUTO)
+static bool     gCamBroken = false;                 // camera failed to start: do not keep retrying every press
+
+static void camStart(const char *firstTrigger) {
+  if (!CAMERA_ENABLED || gCamBroken) return;
+  if (!gCamActive) {
+    if (!hal_cameraStart()) { gCamBroken = true; Serial.println("[SafeSignal] camera: could not start (no camera driver) - camera disabled"); return; }
+    gCamActive = true;
+    Serial.println("[SafeSignal] camera: ON");
+  }
+  gCamEndAt = millis() + CAMERA_MAX_SESSION_MS;
+  gCamNextAt = millis();                            // first photo right away
+  snprintf(gCamTrigger, sizeof(gCamTrigger), "%s", firstTrigger);
+  gDirty = true;
+}
+
+static void camStop() {
+  if (!gCamActive) return;
+  gCamActive = false;
+  hal_cameraStop();
+  Serial.println("[SafeSignal] camera: OFF");
+  gDirty = true;
+}
+
+static void camCapture() {
+  uint8_t *jpg = nullptr; size_t len = 0;
+  if (hal_cameraCapture(&jpg, &len) && jpg) setPendingImage(jpg, len, gCamTrigger);
+  else Serial.println("[SafeSignal] camera: capture failed");
+  snprintf(gCamTrigger, sizeof(gCamTrigger), "AUTO");
+}
+
+// Called from loop(): runs caregiver commands and the 60-second timer.
+static void camTick() {
+  int cmd = gCamCmd; gCamCmd = CAMCMD_NONE;
+  if (cmd == CAMCMD_START) camStart("REMOTE");
+  else if (cmd == CAMCMD_STOP) camStop();
+  else if (cmd == CAMCMD_CAPTURE) { if (!gCamActive) camStart("REMOTE"); else { snprintf(gCamTrigger, sizeof(gCamTrigger), "REMOTE"); gCamNextAt = millis(); } }
+  if (!gCamActive) return;
+  uint32_t now = millis();
+  if ((int32_t)(now - gCamEndAt) >= 0) { camStop(); return; }     // session limit reached
+  if ((int32_t)(now - gCamNextAt) >= 0) { gCamNextAt = now + CAMERA_INTERVAL_MS; camCapture(); }
+}
+
+// =====================================================================
 // 9. USER INTERFACE  (240 x 320, buttons A / B)
 // =====================================================================
 struct Choice { const char *status; const char *label; uint32_t color; };
@@ -665,7 +868,6 @@ static bool     gOverlay = false;
 static uint32_t gOverlayUntil = 0;
 static uint32_t gOverlayColor = COL_GREY;
 static String   gOvTitle, gOvL1, gOvL2;
-static bool     gDirty = true;
 
 static uint32_t gCooldownUntil = 0;
 static bool     gAwaitingPress = false;                // overlay "Sending..." until the network task reports
@@ -699,6 +901,7 @@ static void drawMain() {
   hal_text(line, 4, 300, COL_LGREY, 16);
   snprintf(line, sizeof(line), "GPS:%s", gGpsOk == 1 ? "OK" : gGpsOk == 0 ? "X" : "...");
   hal_text(line, 100, 300, COL_LGREY, 16);
+  if (gCamActive) { hal_circle(166, 309, 5, COL_RED); hal_text("CAM", 174, 300, COL_RED, 16); }   // camera is on
   hal_circle(224, 309, 7, gOnline == 1 ? COL_CONN : gOnline == 0 ? COL_OFF : 0x777777);
   hal_present();
 }
@@ -753,6 +956,7 @@ static void pressChoice(int idx) {
   gPressSeq = submit(SLOT_STATUS, payload);
   gAwaitingPress = true; gAwaitingSince = millis();
   showOverlay(CHOICES[idx].color, "Sending...", "", "", 12000);
+  camStart(CHOICES[idx].status);                       // camera on: photo now, then one every 60 s
 }
 
 static void handleUiEvents() {
@@ -803,6 +1007,8 @@ static void devCommands() {
       case '2': pushUi(UE_ACK, 2); break;
       case '3': pushUi(UE_ACK, 3); break;
       case 't': serverTest(); break;
+      case 'c': camStart("TEST"); break;                 // DEV: start the camera session now
+      case 'x': camStop(); break;                         // DEV: stop it
       case 'p': gChildId = "child_demo"; gChildName = "Demo"; gDeviceToken = "demo-token"; gPaired = true; savePairing(); pushUi(UE_PAIRED); break;
       case 'u': clearPairing(); newPairCode(); gMode = MODE_PAIRING; gDirty = true; Serial.println("DEV: unpaired"); break;
       case 'r': SIM.battery = -1; SIM.gpsLost = false; SIM.offline = false; Serial.println("DEV: reset simulations"); break;
@@ -837,10 +1043,10 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   gLastValidFix = millis();
-  xTaskCreatePinnedToCore(networkTask, "net", 12288, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(networkTask, "net", 16384, nullptr, 1, nullptr, 0);
 
   Serial.printf("[SafeSignal] K10 watch running. Endpoint: %s\n", API_ENDPOINT);
-  Serial.println("DEV keys: b/B battery, g/G gps, o/O internet, 1/2/3 acks, r reset, t server test");
+  Serial.println("DEV keys: b/B battery, g/G gps, o/O internet, 1/2/3 acks, r reset, t server test, c camera on, x camera off");
   evalBattery();
 }
 
@@ -871,6 +1077,7 @@ void loop() {
   gPrevA = a; gPrevB = b;
 
   handleUiEvents();
+  camTick();
 
   if (gAwaitingPress && now - gAwaitingSince > REQUEST_TIMEOUT_MS + 4000) {   // network task never answered
     gAwaitingPress = false;
