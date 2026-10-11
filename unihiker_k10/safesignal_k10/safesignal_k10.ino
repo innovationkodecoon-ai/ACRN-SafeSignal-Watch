@@ -42,6 +42,12 @@
  *   caregiver app sends cameraCommand STOP. The caregiver app can also answer with cameraCommand START or
  *   CAPTURE_NOW ("take a photo now"). A red CAM marker on the main screen shows while the camera is on.
  *
+ * LIVE CAMERA FROM THE APP: when the caregiver taps Start (or Photo) in the app's Camera page, the watch
+ *   receives cameraCommand START / CAPTURE_NOW in Base44's reply to its next heartbeat (every 5 s), switches the
+ *   K10 camera ON and shows the LIVE camera picture on the K10 screen (red "LIVE CAMERA" bar). Press A or B to
+ *   bring the buttons back for 10 s (the child can always press HELP). Photos are taken now and every 60 s.
+ *   Stop in the app (or after 60 min) turns the camera off. The heartbeat also tells Base44 cameraOn true/false.
+ *
  * FILE LAYOUT
  *   1. CONFIG ........ endpoint, IDs, timings, Wi-Fi, location source
  *   2. HARDWARE LAYER  the ONLY code that touches the K10 library (screen, buttons, battery).
@@ -91,7 +97,7 @@ static const bool TLS_INSECURE = true;
 
 static const uint32_t COOLDOWN_MS         = 2500;   // ignore presses for this long after a press
 static const uint32_t RETRY_INTERVAL_MS   = 5000;   // retry unsent events this often
-static const uint32_t HEARTBEAT_MS        = 15000;  // "I'm alive" ping; Base44 flags the watch if several are missed
+static const uint32_t HEARTBEAT_MS        = 5000;   // "I'm alive" ping AND how often the watch checks for app commands (Start/Stop/Photo). 15000 = slower but lighter
 static const int      LOW_BATTERY_PERCENT = 20;     // LOW_BATTERY event when the level reaches this or lower
 static const uint32_t BATTERY_CHECK_MS    = 10000;
 static const uint32_t GPS_CHECK_MS        = 5000;   // how often location is sampled
@@ -107,6 +113,8 @@ static const bool     CAMERA_ENABLED          = true;      // false = never use 
 static const uint32_t CAMERA_INTERVAL_MS      = 60000;     // one photo every 60 s while the camera session is on
 static const uint32_t CAMERA_MAX_SESSION_MS   = 3600000UL; // auto-stop after 60 min (the caregiver can stop it earlier)
 static const int      CAMERA_JPEG_QUALITY     = 15;        // 1-63, LOWER = better quality / bigger file
+static const bool     CAMERA_LIVE_PREVIEW     = true;      // show the live camera picture on the K10 screen while the camera is on
+static const uint32_t BUTTONS_HOLD_MS         = 10000;     // pressing A/B during live view shows the buttons screen this long
 static const uint32_t IMAGE_TIMEOUT_MS        = 20000;     // photo upload timeout
 static const int      IMAGE_MAX_TRIES         = 4;         // then the photo is dropped (a newer one replaces it anyway)
 
@@ -185,13 +193,15 @@ static void *bigAlloc(size_t n) { void *p = psramFound() ? ps_malloc(n) : nullpt
 static bool hal_cameraStart() {
 #ifdef HAVE_ESP_CAMERA
   k10.initBgCamerImage();            // brings up the K10 camera
-  k10.setBgCamerImage(false);        // keep the LCD free for the SafeSignal screen
+  k10.setBgCamerImage(false);        // preview is switched on/off by hal_cameraPreview()
   return true;
 #else
   return false;
 #endif
 }
-static void hal_cameraStop() { /* camera stays initialised; we simply stop capturing */ }
+// Live camera picture behind the SafeSignal screen (true) or plain black background (false).
+static void hal_cameraPreview(bool on) { k10.setBgCamerImage(on); }
+static void hal_cameraStop() { hal_cameraPreview(false); /* camera stays initialised; we simply stop capturing */ }
 // Takes one photo. On success *jpg is a bigAlloc'd JPEG (caller frees with free()) and *len its size.
 static bool hal_cameraCapture(uint8_t **jpg, size_t *len) {
 #ifdef HAVE_ESP_CAMERA
@@ -248,6 +258,7 @@ static volatile int8_t gGpsOk  = -1;       // -1 unknown, 0 lost, 1 ok
 static volatile int    gBattery = -1;      // percent or -1 (n/a)
 static String gOfflineSince;
 static bool   gDirty = true;               // screen needs redrawing
+static volatile bool gCamActive = false;   // camera session on (shared with the network task / heartbeat)
 
 // ---- pairing ----
 enum Mode { MODE_PAIRING, MODE_MAIN };
@@ -480,6 +491,7 @@ static volatile int gCamCmd = CAMCMD_NONE;
 
 static void handleAck(const String &body) {
   String cc = jsonGetString(body, "cameraCommand");
+  if (cc != "") Serial.printf("[SafeSignal] app command received: cameraCommand = %s\n", cc.c_str());
   if (cc == "START") gCamCmd = CAMCMD_START;
   else if (cc == "STOP") gCamCmd = CAMCMD_STOP;
   else if (cc == "CAPTURE_NOW") gCamCmd = CAMCMD_CAPTURE;
@@ -755,7 +767,9 @@ static void networkTask(void *) {
     // several missed beats (about 45 s) as "connectivity lost".
     if (now - lastHb >= HEARTBEAT_MS || lastHb == 0) {
       lastHb = now ? now : 1;
-      sendPayload(buildEventPayload("HEARTBEAT", gBattery >= 0 ? String(",\"batteryLevel\":") + String((int)gBattery) : String("")), -1, true);
+      String hb = String(",\"cameraOn\":") + (gCamActive ? "true" : "false");
+      if (gBattery >= 0) hb += ",\"batteryLevel\":" + String((int)gBattery);
+      sendPayload(buildEventPayload("HEARTBEAT", hb), -1, true);
     }
     vTaskDelay(pdMS_TO_TICKS(100));
   }
@@ -807,10 +821,12 @@ static void gpsTick() {
 // =====================================================================
 // 8b. CAMERA SESSION  (started by any button press, then a photo every 60 s)
 // =====================================================================
-static bool     gCamActive = false;
 static uint32_t gCamEndAt = 0, gCamNextAt = 0;
 static char     gCamTrigger[8] = "AUTO";            // trigger label for the NEXT photo (status after a press, then AUTO)
 static bool     gCamBroken = false;                 // camera failed to start: do not keep retrying every press
+static uint32_t gButtonsUntil = 0;                  // during live view: show the buttons screen until this time
+static uint32_t gLastCapAt = 0;                     // when the last photo was taken (ignores command repeats)
+static bool     gPreviewOn = false;                 // is the live picture currently on the screen?
 
 static void camStart(const char *firstTrigger) {
   if (!CAMERA_ENABLED || gCamBroken) return;
@@ -819,6 +835,7 @@ static void camStart(const char *firstTrigger) {
     gCamActive = true;
     Serial.println("[SafeSignal] camera: ON");
   }
+  gButtonsUntil = 0;                                // live view straight away (unless an overlay is showing)
   gCamEndAt = millis() + CAMERA_MAX_SESSION_MS;
   gCamNextAt = millis();                            // first photo right away
   snprintf(gCamTrigger, sizeof(gCamTrigger), "%s", firstTrigger);
@@ -828,12 +845,15 @@ static void camStart(const char *firstTrigger) {
 static void camStop() {
   if (!gCamActive) return;
   gCamActive = false;
+  gPreviewOn = false;
+  gButtonsUntil = 0;
   hal_cameraStop();
   Serial.println("[SafeSignal] camera: OFF");
   gDirty = true;
 }
 
 static void camCapture() {
+  gLastCapAt = millis();
   uint8_t *jpg = nullptr; size_t len = 0;
   if (hal_cameraCapture(&jpg, &len) && jpg) setPendingImage(jpg, len, gCamTrigger);
   else Serial.println("[SafeSignal] camera: capture failed");
@@ -843,9 +863,10 @@ static void camCapture() {
 // Called from loop(): runs caregiver commands and the 60-second timer.
 static void camTick() {
   int cmd = gCamCmd; gCamCmd = CAMCMD_NONE;
-  if (cmd == CAMCMD_START) camStart("REMOTE");
+  if (cmd == CAMCMD_START || cmd == CAMCMD_CAPTURE) gCamBroken = false;   // an app request retries a failed camera start
+  if (cmd == CAMCMD_START) { if (!gCamActive) camStart("REMOTE"); else gCamEndAt = millis() + CAMERA_MAX_SESSION_MS; }   // repeated START just extends the session
   else if (cmd == CAMCMD_STOP) camStop();
-  else if (cmd == CAMCMD_CAPTURE) { if (!gCamActive) camStart("REMOTE"); else { snprintf(gCamTrigger, sizeof(gCamTrigger), "REMOTE"); gCamNextAt = millis(); } }
+  else if (cmd == CAMCMD_CAPTURE) { if (!gCamActive) camStart("REMOTE"); else if (millis() - gLastCapAt > 4000) { snprintf(gCamTrigger, sizeof(gCamTrigger), "REMOTE"); gCamNextAt = millis(); } }
   if (!gCamActive) return;
   uint32_t now = millis();
   if ((int32_t)(now - gCamEndAt) >= 0) { camStop(); return; }     // session limit reached
@@ -876,6 +897,22 @@ static uint32_t gAwaitingSince = 0;
 static void showOverlay(uint32_t color, const String &t, const String &l1, const String &l2, uint32_t ms) {
   gOverlay = true; gOverlayColor = color; gOvTitle = t; gOvL1 = l1; gOvL2 = l2;
   gOverlayUntil = millis() + ms; gDirty = true;
+}
+
+// Live view is on while the camera session runs, unless a message / the buttons screen is showing.
+static bool previewWanted() {
+  return CAMERA_LIVE_PREVIEW && gCamActive && gMode == MODE_MAIN && !gOverlay && (int32_t)(millis() - gButtonsUntil) >= 0;
+}
+
+// Live camera picture is drawn by the K10 behind the canvas; we only add two small text bars.
+static void drawLive() {
+  hal_clear();
+  hal_rect(0, 0, SCREEN_W, 26, 0x000000);
+  hal_circle(12, 13, 6, COL_RED);
+  hal_text("LIVE CAMERA", 26, 5, COL_RED, 16);
+  hal_rect(0, 294, SCREEN_W, 26, 0x000000);
+  textCentered("Press A or B for buttons", 298, COL_WHITE, 16);
+  hal_present();
 }
 
 static void drawMain() {
@@ -1047,6 +1084,11 @@ void setup() {
 
   Serial.printf("[SafeSignal] K10 watch running. Endpoint: %s\n", API_ENDPOINT);
   Serial.println("DEV keys: b/B battery, g/G gps, o/O internet, 1/2/3 acks, r reset, t server test, c camera on, x camera off");
+#ifdef HAVE_ESP_CAMERA
+  Serial.println("[SafeSignal] camera driver: present");
+#else
+  Serial.println("[SafeSignal] camera driver: NOT FOUND in this board package - the camera cannot start");
+#endif
   evalBattery();
 }
 
@@ -1064,6 +1106,8 @@ void loop() {
     if (b && !gPrevB && !gOverlay) { gMode = MODE_MAIN; gDirty = true; }        // B = skip for now
     if (now - gLastPairDraw >= 1000) { gLastPairDraw = now; if (!gOverlay) gDirty = true; }   // countdown
     if (!USE_FIXED_PAIR_CODE && millis() - gPairCodeAt > PAIR_CODE_LIFE_MS) { newPairCode(); gDirty = true; }
+  } else if (gPreviewOn && !gOverlay && ((a && !gPrevA) || (b && !gPrevB))) {
+    gButtonsUntil = now + BUTTONS_HOLD_MS; gDirty = true;           // live view: first press just brings the buttons back
   } else {
     if (a && !gPrevA && !gOverlay) { gSel = (gSel + 1) % 3; gDirty = true; }
     if (b && !gPrevB) {
@@ -1089,9 +1133,12 @@ void loop() {
   if (gOnline != gDrawnOnline || gGpsOk != gDrawnGps || gBattery != gDrawnBatt) {
     gDrawnOnline = gOnline; gDrawnGps = gGpsOk; gDrawnBatt = gBattery; if (!gOverlay) gDirty = true;
   }
+  bool wantPreview = previewWanted();
+  if (wantPreview != gPreviewOn) { gPreviewOn = wantPreview; hal_cameraPreview(wantPreview); gDirty = true; }
+  if (gCamActive && !gPreviewOn && gButtonsUntil && (int32_t)(now - gButtonsUntil) >= 0) gDirty = true;
   if (gDirty) {
     gDirty = false;
-    if (gOverlay) drawOverlay(); else if (gMode == MODE_PAIRING) drawPairing(); else drawMain();
+    if (gOverlay) drawOverlay(); else if (gMode == MODE_PAIRING) drawPairing(); else if (gPreviewOn) drawLive(); else drawMain();
   }
   delay(20);
 }

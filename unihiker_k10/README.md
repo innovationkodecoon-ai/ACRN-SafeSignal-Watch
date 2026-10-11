@@ -51,3 +51,6 @@ Type both into the app form. They are shown on the watch pairing screen and prin
 - **LOW_BATTERY** is sent once when the battery reaches 20% or lower (re-arms above 20%). It needs a battery reading: install DFRobot's `DFRobot_UnihikerExpansion` library (uses `eunihiker.getBattery()`); otherwise the screen shows `Batt:n/a`. Test with Serial key `b`.
 - **Camera:** any button press (OK / LOST / HELP) starts a camera session: photo now, then one every 60 s, uploaded as `CAMERA_IMAGE` (JPEG base64). Stops after 60 min or when Base44 replies `cameraCommand: "STOP"`; `START` / `CAPTURE_NOW` also supported. A red `CAM` marker shows on screen while on. Serial keys: `c` start, `x` stop.
 - The camera calls are in the `hal_camera*` functions (section 2) and were written without the board.
+
+## Camera started from the app (Start / Photo / Stop)
+The watch checks for app commands on every heartbeat (now every 5 s). `cameraCommand` START turns the K10 camera on and shows the live picture on the K10 screen (press A/B to bring the buttons back for 10 s), photos are taken now and every 60 s; STOP turns it off; CAPTURE_NOW takes one photo. The heartbeat reports `cameraOn` true/false so the app can show the real camera state. Serial shows `app command received: cameraCommand = START` when the command arrives.
