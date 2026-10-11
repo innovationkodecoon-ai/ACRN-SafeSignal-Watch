@@ -54,3 +54,6 @@ Type both into the app form. They are shown on the watch pairing screen and prin
 
 ## Camera started from the app (Start / Photo / Stop)
 The watch checks for app commands on every heartbeat (now every 5 s). `cameraCommand` START turns the K10 camera on and shows the live picture on the K10 screen (press A/B to bring the buttons back for 10 s), photos are taken now and every 60 s; STOP turns it off; CAPTURE_NOW takes one photo. The heartbeat reports `cameraOn` true/false so the app can show the real camera state. Serial shows `app command received: cameraCommand = START` when the command arrives.
+
+## LIVE camera (replaces the 60-second photos)
+Caregiver app **Turn on live camera** -> watch gets `cameraCommand: START` -> K10 camera ON, live picture on the K10 screen, frames streamed to Base44 as `LIVE_FRAME` events (~1-3 per second, "near-live"). **Turn off** -> `cameraCommand: STOP` arrives in the reply to the next frame (~1 s) -> camera OFF and the K10 goes back to the main screen. `CAPTURE_NOW` saves one photo (`CAMERA_IMAGE`). Child presses OK/LOST/HELP also start the live camera (`LIVE_ON_PRESS`). Safety: auto-stop after 30 min or if no frame is delivered for 60 s. Serial keys: `c` live on, `x` live off.
