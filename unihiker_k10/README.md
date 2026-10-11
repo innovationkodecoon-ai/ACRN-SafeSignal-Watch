@@ -57,3 +57,6 @@ The watch checks for app commands on every heartbeat (now every 5 s). `cameraCom
 
 ## LIVE camera (replaces the 60-second photos)
 Caregiver app **Turn on live camera** -> watch gets `cameraCommand: START` -> K10 camera ON, live picture on the K10 screen, frames streamed to Base44 as `LIVE_FRAME` events (~1-3 per second, "near-live"). **Turn off** -> `cameraCommand: STOP` arrives in the reply to the next frame (~1 s) -> camera OFF and the K10 goes back to the main screen. `CAPTURE_NOW` saves one photo (`CAMERA_IMAGE`). Child presses OK/LOST/HELP also start the live camera (`LIVE_ON_PRESS`). Safety: auto-stop after 30 min or if no frame is delivered for 60 s. Serial keys: `c` live on, `x` live off.
+
+## Camera only on the caregiver's request
+`LIVE_ON_PRESS = false`: the child's buttons never start the camera. START/Photo commands are ignored for 20 s after power-on (stale commands). The K10 live bar shows `sent N` / `HTTP code` / `no link` so you can see whether the app receives the frames. Frames are `LIVE_FRAME` events; `"saveAsPhoto":true` marks a frame to also keep as a photo.

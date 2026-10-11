@@ -42,8 +42,10 @@
  *   as LIVE_FRAME events (small JPEGs, about 1-3 per second = "near-live" video) which the app shows.
  *   Caregiver taps "Turn off live camera" -> cameraCommand STOP arrives in the reply to the next frame (about
  *   1 s) -> camera OFF, streaming stops and the K10 returns to its MAIN SCREEN.
- *   The child pressing I'M OK / I'M LOST / HELP also starts the live camera (LIVE_ON_PRESS) and a saved photo is
- *   taken at that moment. cameraCommand CAPTURE_NOW (the app's "Photo" button) saves one photo.
+ *   THE CAMERA NEVER TURNS ON BY ITSELF: only the caregiver's Start / Photo in the app switches it on (the child's
+ *   button presses do not, unless you set LIVE_ON_PRESS = true). Camera commands are ignored for the first 20 s
+ *   after the watch boots, so an old pending command cannot switch the camera on at start-up.
+ *   cameraCommand CAPTURE_NOW (the app's "Photo" button) saves one photo.
  *   Press A or B during live view to bring the buttons back for 10 s (the child can always press HELP).
  *   Safety: the camera also stops after CAMERA_MAX_SESSION_MS (30 min) or if frames cannot be delivered for 60 s.
  *   A red "CAM" marker is shown whenever the camera is on.
@@ -115,7 +117,8 @@ static const uint32_t CAMERA_MAX_SESSION_MS   = 1800000UL; // auto-stop after 30
 static const int      CAMERA_JPEG_QUALITY     = 15;        // 1-63, LOWER = better quality / bigger file
 static const bool     CAMERA_LIVE_PREVIEW     = true;      // show the live camera picture on the K10 screen while the camera is on
 static const uint32_t BUTTONS_HOLD_MS         = 10000;     // pressing A/B during live view shows the buttons screen this long
-static const bool     LIVE_ON_PRESS           = true;      // child presses OK / LOST / HELP -> live camera starts too
+static const bool     LIVE_ON_PRESS           = false;     // false = camera ONLY turns on when the caregiver asks (true = child presses also start it)
+static const uint32_t CMD_IGNORE_AFTER_BOOT_MS = 20000;    // ignore START / Photo commands this long after power-on (stale commands)
 static const int      LIVE_JPEG_QUALITY       = 25;        // live frames: 1-63, higher = smaller & faster
 static const uint32_t LIVE_FRAME_MIN_MS       = 250;       // never send frames faster than this (real speed = upload speed, ~1-3 fps)
 static const uint32_t LIVE_NOLINK_STOP_MS     = 60000;     // camera stops if no frame could be delivered for this long
@@ -492,13 +495,17 @@ static int ackCode(const String &a) {
 //   {"cameraCommand":"START"|"STOP"|"CAPTURE_NOW"} in any response
 enum CamCmd { CAMCMD_NONE = 0, CAMCMD_START = 1, CAMCMD_STOP = 2, CAMCMD_CAPTURE = 3 };
 static volatile int gCamCmd = CAMCMD_NONE;
+static uint32_t gCmdAcceptAt = 0;                    // set in setup(): commands that switch the camera ON are ignored before this time
 
 static void handleAck(const String &body) {
   String cc = jsonGetString(body, "cameraCommand");
   if (cc != "") Serial.printf("[SafeSignal] app command received: cameraCommand = %s\n", cc.c_str());
-  if (cc == "START") gCamCmd = CAMCMD_START;
-  else if (cc == "STOP") gCamCmd = CAMCMD_STOP;
-  else if (cc == "CAPTURE_NOW") gCamCmd = CAMCMD_CAPTURE;
+  bool accept = (int32_t)(millis() - gCmdAcceptAt) >= 0;          // not right after power-on
+  if (cc == "STOP") gCamCmd = CAMCMD_STOP;                        // STOP is always obeyed
+  else if (cc == "START" || cc == "CAPTURE_NOW") {
+    if (accept) gCamCmd = (cc == "START") ? CAMCMD_START : CAMCMD_CAPTURE;
+    else Serial.println("[SafeSignal] camera command ignored (watch just started)");
+  }
 
   String a = jsonGetString(body, "acknowledgement");
   if (a == "") a = jsonGetString(body, "ack");
@@ -650,6 +657,8 @@ static uint32_t gLiveSeq = 0;
 static volatile bool gLivePending = false;
 static volatile uint32_t gLastLiveOk = 0;            // last time a frame was delivered
 static volatile bool gLiveCloseReq = false;
+static volatile uint32_t gLiveOkCount = 0;           // frames the app/Base44 accepted (shown on the K10 screen)
+static volatile int gLiveLastCode = 0;               // last HTTP code of a frame upload (0 = no link)
 static WiFiClientSecure *gLiveClient = nullptr;
 static HTTPClient *gLiveHttp = nullptr;
 
@@ -732,7 +741,7 @@ static void uploadImage() {
   if (jpg) free(jpg);
 }
 
-// Upload the pending live frame (LIVE_FRAME, or CAMERA_IMAGE when it is also a saved photo).
+// Upload the pending live frame as a LIVE_FRAME event ("saveAsPhoto":true when it should also be kept as a photo).
 // The reply carries the caregiver's commands, so "Turn off live camera" reaches the watch within one frame.
 static void uploadLive() {
   xSemaphoreTake(gMutex, portMAX_DELAY);
@@ -744,7 +753,7 @@ static void uploadLive() {
   if (!jpg) return;
   Fix f = getFix();
   String head = "{\"childId\":\"" + gChildId + "\",\"deviceId\":\"" + String(DEVICE_ID) +
-                "\",\"eventType\":\"" + (snap ? "CAMERA_IMAGE" : "LIVE_FRAME") + "\",\"trigger\":\"" + trig +
+                "\",\"eventType\":\"LIVE_FRAME\",\"saveAsPhoto\":" + (snap ? "true" : "false") + ",\"trigger\":\"" + trig +
                 "\",\"seq\":" + String((int)seq) +
                 ",\"latitude\":" + jnum(f.ok, f.lat) + ",\"longitude\":" + jnum(f.ok, f.lng) +
                 ",\"cameraOn\":true,\"timestamp\":\"" + timestampNow() + "\",\"imageFormat\":\"jpeg\",\"imageBase64\":\"";
@@ -764,14 +773,15 @@ static void uploadLive() {
   if (reached) {
     setOnline(true);
     gLastHttpCode = code;
+    gLiveLastCode = code;
     if (code >= 200 && code < 300) {
-      gLastLiveOk = millis();
+      gLastLiveOk = millis(); gLiveOkCount++;
       static uint32_t nOk = 0;                      // progress line so you can see the stream is running
       if (++nOk == 1 || nOk % 20 == 0) Serial.printf("[SafeSignal] live frames delivered: %u\n", (unsigned)nOk);
     } else Serial.printf("[SafeSignal] live frame -> HTTP %d %s\n", code, resp.substring(0, 120).c_str());
     handleAck(resp);                                // picks up cameraCommand STOP etc.
   } else {
-    gLastHttpCode = 0;
+    gLastHttpCode = 0; gLiveLastCode = 0;
     if (gOnline == 1) setOnline(false);
   }
 }
@@ -1034,6 +1044,11 @@ static void drawLive() {
   hal_rect(0, 0, SCREEN_W, 26, 0x000000);
   hal_circle(12, 13, 6, COL_RED);
   hal_text("LIVE CAMERA", 26, 5, COL_RED, 16);
+  char st[24];                                           // delivery status, so you can see whether the app receives frames
+  if (gLiveLastCode >= 200 && gLiveLastCode < 300) snprintf(st, sizeof(st), "sent %u", (unsigned)gLiveOkCount);
+  else if (gLiveLastCode == 0) snprintf(st, sizeof(st), "no link");
+  else snprintf(st, sizeof(st), "HTTP %d", gLiveLastCode);
+  hal_text(st, 150, 5, (gLiveLastCode >= 200 && gLiveLastCode < 300) ? COL_CONN : COL_OFF, 16);
   hal_rect(0, 294, SCREEN_W, 26, 0x000000);
   textCentered("Press A or B for buttons", 298, COL_WHITE, 16);
   hal_present();
@@ -1182,7 +1197,7 @@ static void devCommands() {
 // 11. setup() / loop()
 // =====================================================================
 static bool gPrevA = false, gPrevB = false;
-static uint32_t gBothSince = 0, gLastPairDraw = 0;
+static uint32_t gBothSince = 0, gLastPairDraw = 0, gLastLiveDraw = 0;
 static int8_t gDrawnOnline = -2, gDrawnGps = -2; static int gDrawnBatt = -2;
 
 void setup() {
@@ -1204,6 +1219,7 @@ void setup() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   gLastValidFix = millis();
+  gCmdAcceptAt = millis() + CMD_IGNORE_AFTER_BOOT_MS;
   xTaskCreatePinnedToCore(networkTask, "net", 16384, nullptr, 1, nullptr, 0);
 
   Serial.printf("[SafeSignal] K10 watch running. Endpoint: %s\n", API_ENDPOINT);
@@ -1260,6 +1276,7 @@ void loop() {
   bool wantPreview = previewWanted();
   if (wantPreview != gPreviewOn) { gPreviewOn = wantPreview; hal_cameraPreview(wantPreview); gDirty = true; }
   if (gCamActive && !gPreviewOn && gButtonsUntil && (int32_t)(now - gButtonsUntil) >= 0) gDirty = true;
+  if (gPreviewOn && now - gLastLiveDraw >= 1500) { gLastLiveDraw = now; gDirty = true; }   // refresh the delivery counter
   if (gDirty) {
     gDirty = false;
     if (gOverlay) drawOverlay(); else if (gMode == MODE_PAIRING) drawPairing(); else if (gPreviewOn) drawLive(); else drawMain();
