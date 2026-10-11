@@ -764,8 +764,11 @@ static void uploadLive() {
   if (reached) {
     setOnline(true);
     gLastHttpCode = code;
-    if (code >= 200 && code < 300) gLastLiveOk = millis();
-    else Serial.printf("[SafeSignal] live frame -> HTTP %d %s\n", code, resp.substring(0, 120).c_str());
+    if (code >= 200 && code < 300) {
+      gLastLiveOk = millis();
+      static uint32_t nOk = 0;                      // progress line so you can see the stream is running
+      if (++nOk == 1 || nOk % 20 == 0) Serial.printf("[SafeSignal] live frames delivered: %u\n", (unsigned)nOk);
+    } else Serial.printf("[SafeSignal] live frame -> HTTP %d %s\n", code, resp.substring(0, 120).c_str());
     handleAck(resp);                                // picks up cameraCommand STOP etc.
   } else {
     gLastHttpCode = 0;
