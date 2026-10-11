@@ -41,3 +41,8 @@ Wire format: watch → `{"eventType":"PAIR_REQUEST","deviceId":"safesignal_k10_0
 
 ## Server test (same as the curl command)
 Serial Monitor: type `t`. It POSTs `{"eventType":"PAIR_REQUEST","deviceId":"test-1","pairingCode":"123456"}` to `API_ENDPOINT` and prints the HTTP code and reply. Expected `200 {"ok":true,"paired":false}`. `user-exception` means the Base44 function behind the URL crashed (old/missing watchStatus code). The pairing screen also shows "Server: OK" / "Server error 500" / "Server: no link".
+
+## Fixed link details for this K10 (matches the app's "Connect Your SafeSignal Device" form)
+- **Device ID:** `SAFESIGNAL-001`  (`DEVICE_ID` in section 1 of the sketch)
+- **Pairing Code:** `482731`  (`FIXED_PAIR_CODE`; set `USE_FIXED_PAIR_CODE=false` for a random code each time)
+Type both into the app form. They are shown on the watch pairing screen and printed in the Serial Monitor. Use a different Device ID/code for each additional watch.

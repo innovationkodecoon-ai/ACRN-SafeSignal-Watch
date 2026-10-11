@@ -14,10 +14,12 @@
  *   Button B = SEND the highlighted choice
  *
  * PAIRING WITH THE CAREGIVER APP:
- *   A new watch shows a 6-digit PAIRING CODE. In the Base44 caregiver app open the child's profile ->
- *   "Link a watch" and type the code. The watch then shows "Paired" and from then on all events are
- *   sent for that child with a private device token (header X-Device-Token).
- *   Pairing screen: A = new code, B = skip for now.  To pair again later: hold A + B for 3 seconds.
+ *   This watch has a FIXED Device ID and Pairing Code (see section 1: DEVICE_ID and FIXED_PAIR_CODE).
+ *   They are shown on the watch's pairing screen and printed in the Serial Monitor. In the caregiver app's
+ *   "Connect Your SafeSignal Device" form type  Device ID = SAFESIGNAL-001  and  Pairing Code = 482731
+ *   (or whatever you set). The watch then shows "Paired" and from then on all events are sent for that
+ *   child with a private device token (header X-Device-Token).
+ *   Pairing screen: B = skip for now.  To pair again later: hold A + B for 3 seconds.
  *
  * Arduino IDE setup:
  *   1. Add the DFRobot UNIHIKER board package (Boards Manager -> "UNIHIKER"), select board "UNIHIKER K10".
@@ -54,7 +56,10 @@ static const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 static const char *API_ENDPOINT = "https://safesignal-caregiver-to-watch-acrn.base44.app/functions/watchStatus";
 // CHILD_ID is only the default before pairing; after pairing the child id comes from the caregiver app.
 static const char *CHILD_ID     = "child_001";
-static const char *DEVICE_ID    = "safesignal_k10_001";   // unique per watch
+// ---- LINK DETAILS FOR THIS WATCH: type these two values into the caregiver app's "Connect Your SafeSignal Device" form ----
+static const char *DEVICE_ID = "SAFESIGNAL-001";          // fixed Device ID of this K10 (unique per watch)
+static const bool  USE_FIXED_PAIR_CODE = true;            // true = always the same code below; false = random code each time
+static const char *FIXED_PAIR_CODE     = "482731";        // fixed 6-digit Pairing Code of this K10
 // Extra header if Base44 needs one (leave EXTRA_HEADER_NAME empty for none), e.g. "api_key" / "xxxx"
 static const char *EXTRA_HEADER_NAME  = "";
 static const char *EXTRA_HEADER_VALUE = "";
@@ -448,10 +453,14 @@ static SendResult sendPayload(const String &payload, int slot, bool quiet) {
 
 // ---- pairing: new code, save/clear, poll Base44 ----
 static void newPairCode() {
-  uint32_t r = (uint32_t)random(1000000);
-  snprintf(gPairCode, sizeof(gPairCode), "%06lu", (unsigned long)r);
+  if (USE_FIXED_PAIR_CODE) {
+    snprintf(gPairCode, sizeof(gPairCode), "%s", FIXED_PAIR_CODE);
+  } else {
+    uint32_t r = (uint32_t)random(1000000);
+    snprintf(gPairCode, sizeof(gPairCode), "%06lu", (unsigned long)r);
+  }
   gPairCodeAt = millis();
-  Serial.printf("[SafeSignal] pairing code: %s\n", gPairCode);
+  Serial.printf("[SafeSignal] >>> LINK THIS WATCH IN THE APP:  Device ID = %s   Pairing Code = %s\n", DEVICE_ID, gPairCode);
 }
 
 static void savePairing() {
@@ -492,7 +501,7 @@ static void pairPoll() {
   setOnline(true);
   static int lastLoggedCode = -1;
   if (code != lastLoggedCode) { lastLoggedCode = code; Serial.printf("[SafeSignal] pairing server replied %d: %s\n", code, resp.substring(0, 200).c_str()); }
-  if (code == 409) { newPairCode(); return; }                       // someone else has this code: pick another
+  if (code == 409 && !USE_FIXED_PAIR_CODE) { newPairCode(); return; }   // someone else has this code: pick another
   if (code < 200 || code >= 300) { Serial.printf("[SafeSignal] pairing -> %d %s\n", code, resp.substring(0, 120).c_str()); return; }
   if (!jsonHasTrue(resp, "paired")) return;
   String cid = jsonGetString(resp, "childId"), tok = jsonGetString(resp, "deviceToken");
@@ -697,27 +706,31 @@ static void drawMain() {
 static void drawPairing() {
   hal_clear();
   textCentered("SafeSignal", 4, COL_WHITE, 24);
-  textCentered("Pair with caregiver", 34, COL_LGREY, 16);
+  textCentered("Connect your device", 34, COL_LGREY, 16);
   textCentered(gOnline == 1 ? "Waiting for caregiver..." : "Connecting...", 54, gOnline == 1 ? COL_CONN : COL_OFF, 16);
 
-  hal_rect(8, 82, SCREEN_W - 16, 70, COL_BLUE);
-  char spaced[16];                                       // "482 913" with extra spacing
-  snprintf(spaced, sizeof(spaced), "%c %c %c   %c %c %c", gPairCode[0], gPairCode[1], gPairCode[2], gPairCode[3], gPairCode[4], gPairCode[5]);
-  textCentered(spaced, 106, COL_WHITE, 24);
+  textCentered("Device ID", 80, COL_LGREY, 16);
+  textCentered(DEVICE_ID, 100, COL_WHITE, 24);
 
-  textCentered("In the caregiver app:", 168, COL_LGREY, 16);
-  textCentered("Child > Link a watch", 190, COL_WHITE, 16);
-  textCentered("and type this code", 212, COL_WHITE, 16);
-  int left = (int)((PAIR_CODE_LIFE_MS - (millis() - gPairCodeAt)) / 1000);
-  if (left < 0) left = 0;
-  char t[24]; snprintf(t, sizeof(t), "Code valid %d:%02d", left / 60, left % 60);
-  textCentered(t, 244, COL_LGREY, 16);
+  textCentered("Pairing Code", 138, COL_LGREY, 16);
+  hal_rect(8, 158, SCREEN_W - 16, 52, COL_BLUE);
+  char spaced[16];                                       // "482 731" with extra spacing
+  snprintf(spaced, sizeof(spaced), "%c %c %c   %c %c %c", gPairCode[0], gPairCode[1], gPairCode[2], gPairCode[3], gPairCode[4], gPairCode[5]);
+  textCentered(spaced, 172, COL_WHITE, 24);
+
+  textCentered("Type both in the app", 224, COL_WHITE, 16);
+  if (!USE_FIXED_PAIR_CODE) {
+    int left = (int)((PAIR_CODE_LIFE_MS - (millis() - gPairCodeAt)) / 1000);
+    if (left < 0) left = 0;
+    char t[24]; snprintf(t, sizeof(t), "Code valid %d:%02d", left / 60, left % 60);
+    textCentered(t, 244, COL_LGREY, 16);
+  }
   char sv[24];                                           // plain-language server status for the helper
   if (gPairHttp == 0) snprintf(sv, sizeof(sv), "Server: no link");
   else if (gPairHttp >= 200 && gPairHttp < 300) snprintf(sv, sizeof(sv), "Server: OK");
   else snprintf(sv, sizeof(sv), "Server error %d", gPairHttp);
   textCentered(sv, 268, (gPairHttp >= 200 && gPairHttp < 300) ? COL_CONN : COL_OFF, 16);
-  hal_text("A:new code  B:skip", 14, 296, COL_LGREY, 16);
+  hal_text(USE_FIXED_PAIR_CODE ? "B: skip for now" : "A:new code  B:skip", 14, 296, COL_LGREY, 16);
   hal_present();
 }
 
@@ -841,10 +854,10 @@ void loop() {
   // Buttons (act on the press edge)
   bool a = hal_buttonA(), b = hal_buttonB();
   if (gMode == MODE_PAIRING) {
-    if (a && !gPrevA && !gOverlay) { newPairCode(); gDirty = true; }            // A = new code
+    if (a && !gPrevA && !gOverlay && !USE_FIXED_PAIR_CODE) { newPairCode(); gDirty = true; }   // A = new code
     if (b && !gPrevB && !gOverlay) { gMode = MODE_MAIN; gDirty = true; }        // B = skip for now
     if (now - gLastPairDraw >= 1000) { gLastPairDraw = now; if (!gOverlay) gDirty = true; }   // countdown
-    if (millis() - gPairCodeAt > PAIR_CODE_LIFE_MS) { newPairCode(); gDirty = true; }
+    if (!USE_FIXED_PAIR_CODE && millis() - gPairCodeAt > PAIR_CODE_LIFE_MS) { newPairCode(); gDirty = true; }
   } else {
     if (a && !gPrevA && !gOverlay) { gSel = (gSel + 1) % 3; gDirty = true; }
     if (b && !gPrevB) {
