@@ -29,9 +29,18 @@
  *   b = battery 18%     B = battery 78%     g = GPS lost     G = GPS restored
  *   o = internet off    O = internet on     1/2/3 = show caregiver acks (safe / on my way / nearby help)
  *   r = reset all simulations     p = fake "paired" reply     u = unpair
+ *   w = walk INTO the next danger zone   a = stand just outside it   W = leave (real location again)
  *   c = live camera ON now     x = live camera OFF (back to main screen)
  *   t = SERVER TEST: sends the same PAIR_REQUEST as the curl test (deviceId test-1, code 123456) and prints
  *       the HTTP code + reply. Expected: 200 {"ok":true,"paired":false}. "user-exception" = the Base44 function crashed.
+ *
+ * GEOFENCING (danger zones): the ZONES table in section 1b lists dangerous places (beach, pond, road...) with a
+ *   radius and a risk 1-4. The watch checks its GPS every 5 s. Entering a zone sends GEOFENCE_ENTER to the caregiver
+ *   app; HIGH / CRITICAL zones also set notifyACRN = true so ACRN is alerted and can offer help. CRITICAL / HIGH zones
+ *   warn 100 m / 50 m BEFORE the zone (GEOFENCE_APPROACHING), repeat GEOFENCE_STILL_INSIDE every 30 s / 60 s while the
+ *   child stays inside, and send GEOFENCE_EXIT when the child leaves. The child sees a coloured full-screen warning.
+ *   Location comes from LOCATION_SOURCE (use LOC_SERIAL_NMEA with a GPS module). Test with the keys w / a / W.
+ *   The camera is NOT turned on by a geofence alert: only the caregiver can switch it on.
  *
  * LOW BATTERY: sends LOW_BATTERY to the caregiver app once when the battery reaches 20% or lower
  *   (re-arms when it goes back above 20%). Needs a battery reading, see hal_batteryPercent() below.
@@ -137,6 +146,37 @@ static const double FIXED_LNG = 103.8198;
 static const int GPS_RX_PIN = 44;
 static const int GPS_TX_PIN = 43;
 static const long GPS_BAUD  = 9600;
+
+// ---------------------------------------------------------------------
+// 1b. DANGER ZONES (geofencing).  EDIT THIS TABLE: one line per dangerous place.
+//   name    : shown on the watch and in the caregiver / ACRN app (no double quotes please)
+//   type    : BEACH, POND, RIVER, ROAD, CONSTRUCTION, ... (free text, the app shows it)
+//   lat,lng : centre of the place (right-click the spot in Google Maps -> copy the numbers)
+//   radiusM : size of the danger area in metres
+//   risk    : 1 LOW | 2 MEDIUM | 3 HIGH | 4 CRITICAL   (risk-based behaviour below)
+// The coordinates below are EXAMPLES in Singapore - replace them with the real places near the child.
+//
+// RISK-BASED BEHAVIOUR
+//   risk 4 CRITICAL : early warning 100 m BEFORE the zone, ACRN + caregiver alerted the moment the child enters
+//                     (1 GPS fix is enough), reminder every 30 s while inside, red full-screen warning
+//   risk 3 HIGH     : early warning 50 m before, ACRN + caregiver alerted on entering, reminder every 60 s
+//   risk 2 MEDIUM   : caregiver alerted on entering (not ACRN), reminder every 5 min
+//   risk 1 LOW      : caregiver told once on entering, no reminders
+// ---------------------------------------------------------------------
+struct Zone { const char *name; const char *type; double lat; double lng; uint16_t radiusM; uint8_t risk; };
+static const Zone ZONES[] = {
+  // name                  type            lat        lng         radius  risk
+  { "East Coast Beach",    "BEACH",        1.30080,   103.91220,  250,    4 },
+  { "MacRitchie Reservoir","WATER",        1.34400,   103.83400,  200,    4 },
+  { "Park Pond",           "POND",         1.36400,   103.84600,  80,     3 },
+  { "Orchard Road",        "BUSY ROAD",    1.30480,   103.83180,  60,     3 },
+  { "Building Site",       "CONSTRUCTION", 1.33000,   103.80000,  70,     2 },
+};
+static const int ZONE_COUNT = sizeof(ZONES) / sizeof(ZONES[0]);
+
+static const uint32_t GEO_CONFIRM_FIXES   = 2;      // consecutive GPS fixes needed to confirm enter / leave (stops GPS jitter false alarms; CRITICAL needs only 1)
+static const double   GEO_LEAVE_MARGIN    = 1.15;   // must be 15% + 10 m outside the zone to count as "left"
+static const bool     GEO_ALERT_ON_BOOT   = true;   // true = if the watch starts inside a danger zone, alert straight away
 
 // =====================================================================
 // 2. HARDWARE LAYER  (K10 specific - keep all unihiker_k10.h calls here)
@@ -254,7 +294,8 @@ static int textWrapped(const String &s, int y, uint32_t color, int size) {
 // =====================================================================
 // 3. SHARED STATE
 // =====================================================================
-struct Sim { volatile int battery = -1; volatile bool gpsLost = false; volatile bool offline = false; };
+struct Sim { volatile int battery = -1; volatile bool gpsLost = false; volatile bool offline = false;
+             volatile bool fake = false; volatile double fLat = 0; volatile double fLng = 0; };   // fake = pretend the watch is at fLat/fLng
 static Sim SIM;
 
 static SemaphoreHandle_t gMutex;
@@ -263,6 +304,9 @@ static Preferences prefs;
 static volatile int8_t gOnline = -1;       // -1 unknown, 0 offline, 1 online
 static volatile int8_t gGpsOk  = -1;       // -1 unknown, 0 lost, 1 ok
 static volatile int    gBattery = -1;      // percent or -1 (n/a)
+static volatile uint8_t gGeoRisk = 0;      // highest risk (1-4) of the danger zone the child is inside now, 0 = none
+static const char *gGeoName = nullptr;     // name of that zone
+static bool    gAwaitingPress = false;     // overlay "Sending..." until the network task reports
 static String gOfflineSince;
 static bool   gDirty = true;               // screen needs redrawing
 static volatile bool gCamActive = false;   // camera session on (shared with the network task / heartbeat)
@@ -358,7 +402,9 @@ static void rememberValid(double lat, double lng) {
 static Fix getFix() {
   Fix f = {false, 0, 0};
   if (SIM.gpsLost) return f;
-  if (LOCATION_SOURCE == LOC_FIXED) {
+  if (SIM.fake) {
+    f = {true, SIM.fLat, SIM.fLng};
+  } else if (LOCATION_SOURCE == LOC_FIXED) {
     f = {true, FIXED_LAT, FIXED_LNG};
   } else if (LOCATION_SOURCE == LOC_SERIAL_NMEA) {
     pollNmea();
@@ -396,8 +442,9 @@ static String buildEventPayload(const char *eventType, const String &extra) {
 // =====================================================================
 // 6. OUTBOX / OFFLINE QUEUE  (latest event of each kind is kept, saved in flash)
 // =====================================================================
-enum SlotId { SLOT_STATUS = 0, SLOT_BATT = 1, SLOT_GPS = 2, SLOT_COUNT = 3 };   // priority order
-static const char *SLOT_KEYS[SLOT_COUNT] = {"q0", "q1", "q2"};
+enum SlotId { SLOT_STATUS = 0, SLOT_BATT = 1, SLOT_GPS = 2, SLOT_GEO = 3, SLOT_COUNT = 4 };
+static const char *SLOT_KEYS[SLOT_COUNT] = {"q0", "q1", "q2", "q3"};
+static const int FLUSH_ORDER[SLOT_COUNT] = {SLOT_GEO, SLOT_STATUS, SLOT_BATT, SLOT_GPS};   // danger-zone alerts go out first
 
 struct Slot { bool used = false; String payload; uint32_t seq = 0; };
 static Slot gSlots[SLOT_COUNT];
@@ -788,7 +835,8 @@ static void uploadLive() {
 
 // Deliver everything queued, highest priority first.
 static void flushOutbox() {
-  for (int i = 0; i < SLOT_COUNT; i++) {
+  for (int k = 0; k < SLOT_COUNT; k++) {
+    int i = FLUSH_ORDER[k];
     String payload; uint32_t seq;
     xSemaphoreTake(gMutex, portMAX_DELAY);
     bool used = gSlots[i].used;
@@ -870,6 +918,8 @@ static void networkTask(void *) {
       lastHb = now ? now : 1;
       String hb = String(",\"cameraOn\":") + (gCamActive ? "true" : "false");
       if (gBattery >= 0) hb += ",\"batteryLevel\":" + String((int)gBattery);
+      if (gGpsOk == 1 && gHaveLastKnown) hb += ",\"latitude\":" + jnum(true, gLastLat) + ",\"longitude\":" + jnum(true, gLastLng);   // live location for the map
+      hb += ",\"dangerRisk\":" + String((int)gGeoRisk);        // 0 = not in a danger zone
       sendPayload(buildEventPayload("HEARTBEAT", hb), -1, true);
     }
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -897,11 +947,123 @@ static void evalBattery() {
   }
 }
 
+// =====================================================================
+// 8a. GEOFENCING  (danger zones, checked on the watch itself - works even when the internet is down;
+//     the alert is queued and sent as soon as the connection returns)
+// =====================================================================
+static void showOverlay(uint32_t color, const String &t, const String &l1, const String &l2, uint32_t ms);   // defined in section 9
+
+enum GeoState : uint8_t { GS_OUTSIDE = 0, GS_APPROACH = 1, GS_INSIDE = 2 };
+static GeoState gGeoState[ZONE_COUNT];
+static uint8_t  gGeoPend[ZONE_COUNT];            // consecutive fixes disagreeing with the current state
+static uint32_t gGeoEnteredAt[ZONE_COUNT];       // millis() when the child entered
+static uint32_t gGeoLastAlert[ZONE_COUNT];       // millis() of the last ENTER / reminder
+static uint16_t gGeoRepeats[ZONE_COUNT];
+static bool     gGeoFirstFix = true;
+
+static const char *riskName(int r) { return r >= 4 ? "CRITICAL" : r == 3 ? "HIGH" : r == 2 ? "MEDIUM" : "LOW"; }
+static bool     riskNotifiesAcrn(int r) { return r >= 3; }                                   // HIGH and CRITICAL go to ACRN
+static uint32_t riskRepeatMs(int r) { return r >= 4 ? 30000UL : r == 3 ? 60000UL : r == 2 ? 300000UL : 0; }   // 0 = no reminders
+static int      riskApproachM(int r) { return r >= 4 ? 100 : r == 3 ? 50 : 0; }              // early warning distance
+static int      riskConfirm(int r) { return r >= 4 ? 1 : (int)GEO_CONFIRM_FIXES; }          // CRITICAL reacts on the first fix
+
+// Distance in metres between two points (haversine)
+static double distanceM(double la1, double lo1, double la2, double lo2) {
+  const double R = 6371000.0, D = 0.017453292519943295;
+  double dLa = (la2 - la1) * D, dLo = (lo2 - lo1) * D;
+  double a = sin(dLa / 2) * sin(dLa / 2) + cos(la1 * D) * cos(la2 * D) * sin(dLo / 2) * sin(dLo / 2);
+  return 2 * R * asin(sqrt(a));
+}
+
+// Sends GEOFENCE_APPROACHING / GEOFENCE_ENTER / GEOFENCE_STILL_INSIDE / GEOFENCE_EXIT to Base44.
+static void geoSend(const char *eventType, int z, const Fix &f, double dist) {
+  const Zone &Z = ZONES[z];
+  bool acrn = (strcmp(eventType, "GEOFENCE_EXIT") == 0 || strcmp(eventType, "GEOFENCE_APPROACHING") == 0) ? false : riskNotifiesAcrn(Z.risk);
+  String x = String(",\"zoneName\":\"") + Z.name + "\",\"zoneType\":\"" + Z.type + "\"";
+  x += String(",\"riskLevel\":\"") + riskName(Z.risk) + "\",\"riskScore\":" + String((int)Z.risk);
+  x += ",\"distanceMeters\":" + String((int)(dist + 0.5)) + ",\"radiusMeters\":" + String((int)Z.radiusM);
+  x += ",\"zoneLatitude\":" + jnum(true, Z.lat) + ",\"zoneLongitude\":" + jnum(true, Z.lng);
+  x += ",\"latitude\":" + jnum(f.ok, f.lat) + ",\"longitude\":" + jnum(f.ok, f.lng);
+  x += String(",\"notifyCaregiver\":true,\"notifyACRN\":") + (acrn ? "true" : "false");
+  x += String(",\"urgent\":") + ((acrn && Z.risk >= 4) ? "true" : "false");
+  if (gGeoEnteredAt[z]) x += ",\"secondsInside\":" + String((int)((millis() - gGeoEnteredAt[z]) / 1000));
+  x += ",\"repeatCount\":" + String((int)gGeoRepeats[z]);
+  if (gBattery >= 0) x += ",\"batteryLevel\":" + String((int)gBattery);
+  submit(SLOT_GEO, buildEventPayload(eventType, x));
+}
+
+// Full-screen warning for the child. Colour follows the risk.
+static void geoWarnScreen(int z, bool reminder) {
+  if (gAwaitingPress) return;                              // do not hide the "Sending..." of a button press
+  const Zone &Z = ZONES[z];
+  uint32_t col = Z.risk >= 4 ? COL_RED : Z.risk == 3 ? 0xE04A00 : Z.risk == 2 ? COL_ORANGE : COL_BLUE;
+  const char *title = Z.risk >= 4 ? "DANGER!" : Z.risk == 3 ? "Be careful!" : "Careful";
+  const char *l2 = Z.risk >= 3 ? "Caregiver and helpers were told. Stay here." : "Your caregiver was told.";
+  showOverlay(col, title, String("You are at ") + Z.name, l2, reminder ? 4000 : 9000);
+}
+
+static void geoTick(const Fix &f) {
+  if (!f.ok) return;
+  uint32_t now = millis();
+  for (int z = 0; z < ZONE_COUNT; z++) {
+    const Zone &Z = ZONES[z];
+    double d = distanceM(f.lat, f.lng, Z.lat, Z.lng);
+    double rIn = Z.radiusM, rApp = Z.radiusM + riskApproachM(Z.risk);
+    GeoState cur = gGeoState[z], want;
+    // hysteresis: once inside / approaching, the child must be clearly outside to leave
+    if (d <= rIn) want = GS_INSIDE;
+    else if (cur == GS_INSIDE && d <= rIn * GEO_LEAVE_MARGIN + 10) want = GS_INSIDE;
+    else if (d <= rApp) want = riskApproachM(Z.risk) ? GS_APPROACH : GS_OUTSIDE;
+    else if (cur == GS_APPROACH && d <= rApp + 20) want = GS_APPROACH;
+    else want = GS_OUTSIDE;
+
+    if (want == cur) {
+      gGeoPend[z] = 0;
+      if (cur == GS_INSIDE) {                               // reminders while the child stays in the zone
+        uint32_t rep = riskRepeatMs(Z.risk);
+        if (rep && now - gGeoLastAlert[z] >= rep) {
+          gGeoLastAlert[z] = now; gGeoRepeats[z]++;
+          Serial.printf("[SafeSignal] GEOFENCE reminder: still inside %s (risk %s)\n", Z.name, riskName(Z.risk));
+          geoSend("GEOFENCE_STILL_INSIDE", z, f, d);
+          geoWarnScreen(z, true);
+        }
+      }
+      continue;
+    }
+    // the first fix after power-on is trusted immediately; otherwise confirm with a 2nd fix (CRITICAL: 1)
+    int need = (gGeoFirstFix && GEO_ALERT_ON_BOOT) ? 1 : riskConfirm(Z.risk);
+    if (++gGeoPend[z] < need) continue;
+    gGeoPend[z] = 0;
+    gGeoState[z] = want;
+    if (want == GS_INSIDE) {
+      gGeoEnteredAt[z] = now ? now : 1; gGeoLastAlert[z] = now; gGeoRepeats[z] = 0;
+      Serial.printf("[SafeSignal] GEOFENCE ENTER: %s (%s) risk %s, %d m from centre\n", Z.name, Z.type, riskName(Z.risk), (int)d);
+      geoSend("GEOFENCE_ENTER", z, f, d);
+      geoWarnScreen(z, false);
+    } else if (cur == GS_INSIDE) {
+      Serial.printf("[SafeSignal] GEOFENCE EXIT: %s\n", Z.name);
+      geoSend("GEOFENCE_EXIT", z, f, d);
+      gGeoEnteredAt[z] = 0;
+      showOverlay(COL_GREEN, "Safe again", String("You left ") + Z.name, "", 3000);
+    } else if (want == GS_APPROACH) {
+      Serial.printf("[SafeSignal] GEOFENCE APPROACHING: %s, %d m away\n", Z.name, (int)d);
+      geoSend("GEOFENCE_APPROACHING", z, f, d);
+      if (!gAwaitingPress) showOverlay(COL_ORANGE, "Careful", String("Danger area ahead: ") + Z.name, "Please turn back", 5000);
+    }
+  }
+  gGeoFirstFix = false;
+  // highest-risk zone the child is inside right now (drives the red banner on the main screen)
+  uint8_t top = 0; const char *nm = nullptr;
+  for (int z = 0; z < ZONE_COUNT; z++) if (gGeoState[z] == GS_INSIDE && ZONES[z].risk > top) { top = ZONES[z].risk; nm = ZONES[z].name; }
+  if (top != gGeoRisk || nm != gGeoName) { gGeoRisk = top; gGeoName = nm; gDirty = true; }
+}
+
 static void gpsTick() {
   Fix f = getFix();
   if (f.ok) {
     gLastValidFix = millis();
     gGpsOk = 1;
+    geoTick(f);
     if (gGpsLostSent) {
       gGpsLostSent = false;
       submit(SLOT_GPS, buildEventPayload("GPS_RESTORED",
@@ -1025,7 +1187,6 @@ static uint32_t gOverlayColor = COL_GREY;
 static String   gOvTitle, gOvL1, gOvL2;
 
 static uint32_t gCooldownUntil = 0;
-static bool     gAwaitingPress = false;                // overlay "Sending..." until the network task reports
 static uint32_t gAwaitingSince = 0;
 
 static void showOverlay(uint32_t color, const String &t, const String &l1, const String &l2, uint32_t ms) {
@@ -1059,7 +1220,10 @@ static void drawMain() {
   textCentered("SafeSignal", 4, COL_WHITE, 24);
   textCentered("Tap how you feel", 34, COL_LGREY, 16);
   bool on = (gOnline == 1);
-  textCentered(on ? "Connected" : "Offline", 54, on ? COL_CONN : COL_OFF, 16);
+  if (gGeoRisk && gGeoName) {                            // inside a danger zone: red banner instead of the connection line
+    String b = String("! ") + gGeoName;
+    textCentered(b.c_str(), 54, gGeoRisk >= 4 ? COL_OFF : COL_ORANGE, 16);
+  } else textCentered(on ? "Connected" : "Offline", 54, on ? COL_CONN : COL_OFF, 16);
 
   int y = 78, h = 62, gap = 6;
   for (int i = 0; i < 3; i++) {
@@ -1169,6 +1333,17 @@ static void handleUiEvents() {
 // =====================================================================
 // 10. DEV COMMANDS (Serial Monitor)
 // =====================================================================
+static int gSimZone = -1;
+// mode 0 = at the centre of the next zone, 1 = just outside its edge (inside the early-warning ring)
+static void simZone(int mode) {
+  if (mode == 0 || gSimZone < 0) gSimZone = (gSimZone + 1) % ZONE_COUNT;
+  const Zone &Z = ZONES[gSimZone];
+  double offM = mode == 0 ? 0 : Z.radiusM + (riskApproachM(Z.risk) ? riskApproachM(Z.risk) / 2 : 15);
+  SIM.fLat = Z.lat + offM / 111320.0; SIM.fLng = Z.lng; SIM.fake = true;
+  Serial.printf("DEV: pretending to be %s %s (%s, risk %s)\n", mode == 0 ? "INSIDE" : "just outside", Z.name, Z.type, riskName(Z.risk));
+  gpsTick(); gpsTick();                                  // two fixes = confirmed, like real life
+}
+
 static void devCommands() {
   while (Serial.available()) {
     char c = (char)Serial.read();
@@ -1187,7 +1362,10 @@ static void devCommands() {
       case 'x': camStop(); break;                         // DEV: stop it
       case 'p': gChildId = "child_demo"; gChildName = "Demo"; gDeviceToken = "demo-token"; gPaired = true; savePairing(); pushUi(UE_PAIRED); break;
       case 'u': clearPairing(); newPairCode(); gMode = MODE_PAIRING; gDirty = true; Serial.println("DEV: unpaired"); break;
-      case 'r': SIM.battery = -1; SIM.gpsLost = false; SIM.offline = false; Serial.println("DEV: reset simulations"); break;
+      case 'w': simZone(0); break;                        // DEV: walk INTO the next danger zone
+      case 'a': simZone(1); break;                        // DEV: stand just OUTSIDE it (early-warning distance)
+      case 'W': SIM.fake = false; gpsTick(); gpsTick(); Serial.println("DEV: back to the real location (left the zone)"); break;
+      case 'r': SIM.battery = -1; SIM.gpsLost = false; SIM.offline = false; SIM.fake = false; Serial.println("DEV: reset simulations"); break;
       default: break;
     }
   }
@@ -1223,7 +1401,7 @@ void setup() {
   xTaskCreatePinnedToCore(networkTask, "net", 16384, nullptr, 1, nullptr, 0);
 
   Serial.printf("[SafeSignal] K10 watch running. Endpoint: %s\n", API_ENDPOINT);
-  Serial.println("DEV keys: b/B battery, g/G gps, o/O internet, 1/2/3 acks, r reset, t server test, c camera on, x camera off");
+  Serial.println("DEV keys: b/B battery, g/G gps, o/O internet, 1/2/3 acks, r reset, t server test, c camera on, x camera off, w walk into danger zone, a approach it, W leave");
 #ifdef HAVE_ESP_CAMERA
   Serial.println("[SafeSignal] camera driver: present");
 #else

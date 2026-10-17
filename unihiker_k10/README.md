@@ -60,3 +60,28 @@ Caregiver app **Turn on live camera** -> watch gets `cameraCommand: START` -> K1
 
 ## Camera only on the caregiver's request
 `LIVE_ON_PRESS = false`: the child's buttons never start the camera. START/Photo commands are ignored for 20 s after power-on (stale commands). The K10 live bar shows `sent N` / `HTTP code` / `no link` so you can see whether the app receives the frames. Frames are `LIVE_FRAME` events; `"saveAsPhoto":true` marks a frame to also keep as a photo.
+
+## Geofencing – danger zones (beach, pond, road …)
+
+The `ZONES` table near the top of `safesignal_k10.ino` (section 1b) lists the dangerous places: name, type, centre
+latitude/longitude, radius in metres and a **risk 1–4**. Replace the example coordinates with real ones.
+The watch checks its GPS every 5 s **on the watch itself**, so it still works when the internet is down (the alert is
+queued and sent first when the connection returns).
+
+| Risk | Early warning | Entering the zone | Reminder while inside |
+|------|---------------|-------------------|------------------------|
+| 4 CRITICAL | 100 m before | caregiver **+ ACRN** (`urgent`), 1 GPS fix is enough | every 30 s |
+| 3 HIGH | 50 m before | caregiver **+ ACRN** | every 60 s |
+| 2 MEDIUM | – | caregiver | every 5 min |
+| 1 LOW | – | caregiver (once) | – |
+
+Events sent (all to the same `watchStatus` endpoint): `GEOFENCE_APPROACHING`, `GEOFENCE_ENTER`,
+`GEOFENCE_STILL_INSIDE`, `GEOFENCE_EXIT`, each with `zoneName, zoneType, riskLevel, riskScore, distanceMeters,
+radiusMeters, zoneLatitude, zoneLongitude, latitude, longitude, notifyCaregiver, notifyACRN, urgent, secondsInside,
+repeatCount`. The heartbeat now also carries `latitude`, `longitude` and `dangerRisk`.
+The child sees a coloured full-screen warning; the main screen shows `! Zone name` while inside. A geofence alert does
+**not** turn the camera on – only the caregiver can do that.
+The K10 board itself has no GPS: set `LOCATION_SOURCE = LOC_SERIAL_NMEA` and wire a GPS module (pins in section 1).
+
+Test without leaving the house (Serial Monitor): `w` = walk into the next zone, `a` = stand just outside it,
+`W` = leave, `r` = reset.
