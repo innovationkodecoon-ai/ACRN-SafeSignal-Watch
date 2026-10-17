@@ -1215,15 +1215,27 @@ static void drawLive() {
   hal_present();
 }
 
+// Connection state shown on the watch:  1 online | 2 Wi-Fi ok but no internet | 3 no Wi-Fi | 0 still connecting
+static int connState() {
+  if (gOnline == 1) return 1;
+  if (WiFi.status() != WL_CONNECTED) return gOnline == 0 ? 3 : 0;
+  return gOnline == 0 ? 2 : 0;
+}
+
 static void drawMain() {
   hal_clear();
   textCentered("SafeSignal", 4, COL_WHITE, 24);
-  textCentered("Tap how you feel", 34, COL_LGREY, 16);
-  bool on = (gOnline == 1);
-  if (gGeoRisk && gGeoName) {                            // inside a danger zone: red banner instead of the connection line
+  if (gGeoRisk && gGeoName) {                            // inside a danger zone: warning replaces the subtitle
     String b = String("! ") + gGeoName;
-    textCentered(b.c_str(), 54, gGeoRisk >= 4 ? COL_OFF : COL_ORANGE, 16);
-  } else textCentered(on ? "Connected" : "Offline", 54, on ? COL_CONN : COL_OFF, 16);
+    textCentered(b.c_str(), 34, gGeoRisk >= 4 ? COL_OFF : COL_ORANGE, 16);
+  } else textCentered("Tap how you feel", 34, COL_LGREY, 16);
+  int cs = connState();                                   // internet status, always visible under the title
+  const char *ct = cs == 1 ? "Online" : cs == 2 ? "No internet" : cs == 3 ? "No Wi-Fi" : "Connecting...";
+  uint32_t cc = cs == 1 ? COL_CONN : cs == 0 ? 0xAAAAAA : COL_OFF;
+  int cw = textW(ct, 16);
+  int cx = (SCREEN_W - (cw + 18)) / 2;
+  hal_circle(cx + 6, 62, 6, cc);
+  hal_text(ct, cx + 18, 54, cc, 16);
 
   int y = 78, h = 62, gap = 6;
   for (int i = 0; i < 3; i++) {
@@ -1242,7 +1254,7 @@ static void drawMain() {
   snprintf(line, sizeof(line), "GPS:%s", gGpsOk == 1 ? "OK" : gGpsOk == 0 ? "X" : "...");
   hal_text(line, 100, 300, COL_LGREY, 16);
   if (gCamActive) { hal_circle(166, 309, 5, COL_RED); hal_text("CAM", 174, 300, COL_RED, 16); }   // camera is on
-  hal_circle(224, 309, 7, gOnline == 1 ? COL_CONN : gOnline == 0 ? COL_OFF : 0x777777);
+  hal_circle(224, 309, 7, cs == 1 ? COL_CONN : cs == 0 ? 0x777777 : COL_OFF);
   hal_present();
 }
 
@@ -1376,7 +1388,7 @@ static void devCommands() {
 // =====================================================================
 static bool gPrevA = false, gPrevB = false;
 static uint32_t gBothSince = 0, gLastPairDraw = 0, gLastLiveDraw = 0;
-static int8_t gDrawnOnline = -2, gDrawnGps = -2; static int gDrawnBatt = -2;
+static int8_t gDrawnOnline = -2, gDrawnGps = -2; static int gDrawnConn = -2; static int gDrawnBatt = -2;
 
 void setup() {
   Serial.begin(115200);
@@ -1448,6 +1460,8 @@ void loop() {
   if (gOverlay && (int32_t)(now - gOverlayUntil) >= 0) { gOverlay = false; gAwaitingPress = false; gDirty = true; }
 
   // Redraw only when something changed (updateCanvas is slow)
+  int cn = connState();
+  if (cn != gDrawnConn) { gDrawnConn = cn; if (!gOverlay) gDirty = true; }
   if (gOnline != gDrawnOnline || gGpsOk != gDrawnGps || gBattery != gDrawnBatt) {
     gDrawnOnline = gOnline; gDrawnGps = gGpsOk; gDrawnBatt = gBattery; if (!gOverlay) gDirty = true;
   }
