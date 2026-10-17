@@ -30,6 +30,7 @@
  *   o = internet off    O = internet on     1/2/3 = show caregiver acks (safe / on my way / nearby help)
  *   r = reset all simulations     p = fake "paired" reply     u = unpair
  *   w = walk INTO the next danger zone   a = stand just outside it   W = leave (real location again)
+ *   f = CAMERA LINK TEST (sends one tiny LIVE_FRAME and explains the reply)
  *   c = live camera ON now     x = live camera OFF (back to main screen)
  *   t = SERVER TEST: sends the same PAIR_REQUEST as the curl test (deviceId test-1, code 123456) and prints
  *       the HTTP code + reply. Expected: 200 {"ok":true,"paired":false}. "user-exception" = the Base44 function crashed.
@@ -680,6 +681,29 @@ static void serverTest() {
   if (code == 200 && resp.indexOf("\"ok\":true") >= 0) Serial.println("[SafeSignal] SERVER TEST: OK - Base44 accepted it");
   else if (resp.indexOf("user-exception") >= 0) Serial.println("[SafeSignal] SERVER TEST: Base44 function crashed (user-exception) - the app behind this URL has old/broken watchStatus code");
   else Serial.println("[SafeSignal] SERVER TEST: Base44 answered but not as expected - see the reply above");
+}
+
+// DEV key 'f': CAMERA LINK TEST. Sends one tiny LIVE_FRAME (a 1-pixel picture, no camera needed) so you can see
+// whether Base44 accepts live frames and whether it answers with a cameraCommand.
+static void cameraLinkTest() {
+  String body = "{\"childId\":\"" + gChildId + "\",\"deviceId\":\"" + String(DEVICE_ID) +
+    "\",\"eventType\":\"LIVE_FRAME\",\"saveAsPhoto\":false,\"trigger\":\"TEST\",\"seq\":1,\"latitude\":null,\"longitude\":null,"
+    "\"cameraOn\":true,\"timestamp\":\"" + timestampNow() + "\",\"imageFormat\":\"jpeg\",\"imageBase64\":"
+    "\"/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=\"}";
+  Serial.printf("[SafeSignal] CAMERA LINK TEST -> POST %s\n", API_ENDPOINT);
+  Serial.printf("  paired: %s, device token: %s, camera driver compiled in: %s\n", gPaired ? "yes" : "NO", gDeviceToken.length() ? "set" : "MISSING",
+#ifdef HAVE_ESP_CAMERA
+    "yes");
+#else
+    "NO");
+#endif
+  int code; String resp;
+  if (!doPost(body, code, resp)) { Serial.println("  RESULT: no connection to the server (check Wi-Fi / URL)"); return; }
+  Serial.printf("  HTTP %d  reply: %s\n", code, resp.substring(0, 300).c_str());
+  if (code == 401 || code == 403) Serial.println("  RESULT: Base44 rejected the watch. Pair the watch with the app first (hold A+B for 3 s, enter the code in the app).");
+  else if (code == 400 || code == 404 || code == 422) Serial.println("  RESULT: Base44 does not understand LIVE_FRAME yet - paste the camera prompt into your Base44 app.");
+  else if (code >= 500 || resp.indexOf("user-exception") >= 0) Serial.println("  RESULT: the Base44 function crashed on LIVE_FRAME - the camera part of watchStatus is broken/missing.");
+  else if (code >= 200 && code < 300) Serial.println("  RESULT: Base44 accepted the frame. Now press 'Turn on live camera' in the app; the Serial Monitor must print 'app command received: cameraCommand = START'.");
 }
 
 static uint32_t gPressSeq = 0;                       // seq of the status event the child just sent
@@ -1370,6 +1394,7 @@ static void devCommands() {
       case '2': pushUi(UE_ACK, 2); break;
       case '3': pushUi(UE_ACK, 3); break;
       case 't': serverTest(); break;
+      case 'f': cameraLinkTest(); break;                  // DEV: does Base44 accept live frames?
       case 'c': gCamBroken = false; camStart("TEST"); break;   // DEV: live camera on now
       case 'x': camStop(); break;                         // DEV: stop it
       case 'p': gChildId = "child_demo"; gChildName = "Demo"; gDeviceToken = "demo-token"; gPaired = true; savePairing(); pushUi(UE_PAIRED); break;
@@ -1413,7 +1438,7 @@ void setup() {
   xTaskCreatePinnedToCore(networkTask, "net", 16384, nullptr, 1, nullptr, 0);
 
   Serial.printf("[SafeSignal] K10 watch running. Endpoint: %s\n", API_ENDPOINT);
-  Serial.println("DEV keys: b/B battery, g/G gps, o/O internet, 1/2/3 acks, r reset, t server test, c camera on, x camera off, w walk into danger zone, a approach it, W leave");
+  Serial.println("DEV keys: b/B battery, g/G gps, o/O internet, 1/2/3 acks, r reset, t server test, c camera on, x camera off, f camera link test, w walk into danger zone, a approach it, W leave");
 #ifdef HAVE_ESP_CAMERA
   Serial.println("[SafeSignal] camera driver: present");
 #else
