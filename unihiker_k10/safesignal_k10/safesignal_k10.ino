@@ -89,8 +89,8 @@
 // =====================================================================
 // 1. CONFIG  (edit this section)
 // =====================================================================
-static const char *WIFI_SSID     = "YOUR_WIFI_NAME";
-static const char *WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+static const char *WIFI_SSID     = "KODECOON-OFFICE";
+static const char *WIFI_PASSWORD = "startworking";
 
 static const char *API_ENDPOINT = "https://safesignal-caregiver-to-watch-acrn.base44.app/functions/watchStatus";
 // CHILD_ID is only the default before pairing; after pairing the child id comes from the caregiver app.
