@@ -43,7 +43,7 @@
  *   Location comes from LOCATION_SOURCE (use LOC_SERIAL_NMEA with a GPS module). Test with the keys w / a / W.
  *   The camera is NOT turned on by a geofence alert: only the caregiver can switch it on.
  *
- * ARE YOU OK?: when the child enters a danger zone the watch shows a blinking "ARE YOU OK?" screen and keeps showing it
+ * ARE YOU SAFE?: when the child enters a danger zone the watch shows a blinking "ARE YOU SAFE?" screen and keeps showing it
  *   until the child presses B (I'M OK) or A (HELP). If there is no answer for 60 s, GEOFENCE_NO_REPLY (urgent) is sent.
  *   The zones come from the caregiver app (ZONES_REQUEST, synced every minute and saved); the table in section 1b is the fallback.
  *   On power-up the PAIRING screen is always shown first; an already paired watch continues to the main screen once online.
@@ -188,7 +188,7 @@ static const int      MAX_ZONES          = 24;
 static const bool     USE_BUILTIN_ZONES  = true;      // false = no built-in zones, only the caregiver's
 static const uint32_t ZONE_SYNC_MS       = 60000;
 
-// "ARE YOU OK?" screen: shown when the child enters a danger zone (risk >= this) until the child presses I'M OK (B) or HELP (A)
+// "ARE YOU SAFE?" screen: shown when the child enters a danger zone (risk >= this) until the child presses I'M OK (B) or HELP (A)
 static const uint8_t  ASK_OK_MIN_RISK    = 1;
 static const uint32_t ASK_ESCALATE_MS    = 60000;     // no answer for this long => GEOFENCE_NO_REPLY (urgent) to caregiver / ACRN
 
@@ -1136,7 +1136,7 @@ static uint16_t gGeoRepeats[MAX_ZONES];
 static bool     gGeoFirstFix = true;
 static char     gGeoNameBuf[32];
 
-// "ARE YOU OK?" state
+// "ARE YOU SAFE?" state
 static bool     gAsk = false;
 static uint8_t  gAskRisk = 0;
 static char     gAskName[32];
@@ -1177,7 +1177,7 @@ static void geoSend(const char *eventType, int z, const Fix &f, double dist) {
   submit(SLOT_GEO, buildEventPayload(eventType, x));
 }
 
-// Full-screen warning for the child (used when the "ARE YOU OK?" screen is not showing). Colour follows the risk.
+// Full-screen warning for the child (used when the "ARE YOU SAFE?" screen is not showing). Colour follows the risk.
 static void geoWarnScreen(int z, bool reminder) {
   if (gAwaitingPress) return;                              // do not hide the "Sending..." of a button press
   const ZoneRT &Z = gZones[z];
@@ -1252,7 +1252,7 @@ static void geoTick(const Fix &f) {
     if (want == GS_INSIDE) {
       gGeoEnteredAt[z] = now ? now : 1; gGeoLastAlert[z] = now; gGeoRepeats[z] = 0;
       Serial.printf("[SafeSignal] GEOFENCE ENTER: %s (%s) risk %s, %d m from centre\n", Z.name, Z.type, riskName(Z.risk), (int)d);
-      if (Z.risk >= ASK_OK_MIN_RISK) {                      // "ARE YOU OK?" until the child answers
+      if (Z.risk >= ASK_OK_MIN_RISK) {                      // "ARE YOU SAFE?" until the child answers
         if (!gAsk) { gAsk = true; gAskSince = now ? now : 1; gAskEscalated = false; gAskRisk = 0; }
         if (Z.risk > gAskRisk) { gAskRisk = Z.risk; copyStr(gAskName, sizeof(gAskName), Z.name); }
         gDirty = true;
@@ -1280,14 +1280,14 @@ static void geoTick(const Fix &f) {
   }
 }
 
-// If the child does not answer "ARE YOU OK?" for ASK_ESCALATE_MS, tell the caregiver / ACRN urgently (once).
+// If the child does not answer "ARE YOU SAFE?" for ASK_ESCALATE_MS, tell the caregiver / ACRN urgently (once).
 static void askTick() {
   if (!gAsk || gAskEscalated) return;
   if (millis() - gAskSince < ASK_ESCALATE_MS) return;
   gAskEscalated = true;
   for (int z = 0; z < gZoneCount; z++) if (strcmp(gZones[z].name, gAskName) == 0) {
     Fix f = getFix();
-    Serial.printf("[SafeSignal] GEOFENCE NO REPLY: the child did not answer ARE YOU OK? in %s\n", gAskName);
+    Serial.printf("[SafeSignal] GEOFENCE NO REPLY: the child did not answer ARE YOU SAFE? in %s\n", gAskName);
     geoSend("GEOFENCE_NO_REPLY", z, f, f.ok ? distanceM(f.lat, f.lng, gZones[z].lat, gZones[z].lng) : 0);
     break;
   }
@@ -1536,12 +1536,12 @@ static void drawPairing() {
   hal_present();
 }
 
-// "ARE YOU OK?" - shown after the child enters a danger zone, until the child answers (B = I'M OK, A = HELP)
+// "ARE YOU SAFE?" - shown after the child enters a danger zone, until the child answers (B = I'M OK, A = HELP)
 static void drawAsk() {
   bool flash = ((millis() / 1000) & 1) == 0;             // top block blinks to get attention
   hal_clear();
   hal_rect(0, 0, SCREEN_W, 130, flash ? COL_RED : 0x8A1010);
-  textCentered("ARE YOU OK?", 14, COL_WHITE, 24);
+  textCentered("ARE YOU SAFE?", 14, COL_WHITE, 24);
   textWrapped(String("You are at ") + gAskName, 52, COL_WHITE, 16);
   textCentered("Danger area", 106, 0xFFD0D0, 16);
   hal_rect(8, 140, SCREEN_W - 16, 64, COL_GREEN);
@@ -1574,7 +1574,7 @@ static void pressChoice(int idx) {
   if (LIVE_ON_PRESS) camStart(CHOICES[idx].status);   // live camera on (+ a saved photo of this moment)
 }
 
-// The child answers "ARE YOU OK?":  idx 0 = I'M OK, 2 = HELP. Sends the normal status AND a geofence reply.
+// The child answers "ARE YOU SAFE?":  idx 0 = I'M OK, 2 = HELP. Sends the normal status AND a geofence reply.
 static void answerAsk(int idx) {
   for (int z = 0; z < gZoneCount; z++) if (strcmp(gZones[z].name, gAskName) == 0) {
     Fix f = getFix();
@@ -1711,7 +1711,7 @@ void loop() {
 
   // Buttons (act on the press edge)
   bool a = hal_buttonA(), b = hal_buttonB();
-  if (gAsk) {                                                            // "ARE YOU OK?" has priority over everything
+  if (gAsk) {                                                            // "ARE YOU SAFE?" has priority over everything
     if (b && !gPrevB) answerAsk(0);                                      // B = I'M OK
     else if (a && !gPrevA) answerAsk(2);                                 // A = HELP
   } else if (gMode == MODE_PAIRING) {
