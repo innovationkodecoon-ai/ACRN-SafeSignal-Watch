@@ -1459,11 +1459,7 @@ static int connState() {
 
 static void drawMain() {
   hal_clear();
-  // Title: two-tone "Safe" + "Signal", centred as one word
-  int tw = textW("SafeSignal", 24), tx = (SCREEN_W - tw) / 2;
-  hal_text("Safe", tx, 4, COL_WHITE, 24);
-  hal_text("Signal", tx + textW("Safe", 24), 4, 0x4DB8FF, 24);
-  hal_rect(SCREEN_W / 2 - 30, 31, 60, 2, 0x4DB8FF);                       // thin accent line under the title
+  textCentered("SafeSignal", 4, 0x4DB8FF, 24);                      // title: all blue, centred
   if (gGeoRisk && gGeoName) {                            // inside a danger zone: warning replaces the subtitle
     String b = String("! ") + gGeoName;
     textCentered(b.c_str(), 35, gGeoRisk >= 4 ? COL_OFF : COL_ORANGE, 16);
