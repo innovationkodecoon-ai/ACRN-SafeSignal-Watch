@@ -270,7 +270,7 @@ static bool hal_cameraCapture(uint8_t **jpg, size_t *len, int quality) {
 }
 
 // Rough text width so we can centre text (the canvas API only takes the top-left corner).
-static int textW(const char *s, int size) { return (int)strlen(s) * (size >= 24 ? 13 : 9); }
+static int textW(const char *s, int size) { return size >= 24 ? (int)strlen(s) * 25 / 2 : (int)strlen(s) * 6; }   // measured on the K10 screen
 static void textCentered(const char *s, int y, uint32_t color, int size) {
   int x = (SCREEN_W - textW(s, size)) / 2;
   if (x < 2) x = 2;
@@ -1248,18 +1248,26 @@ static int connState() {
 
 static void drawMain() {
   hal_clear();
-  textCentered("SafeSignal", 4, COL_WHITE, 24);
+  // Title: two-tone "Safe" + "Signal", centred as one word
+  int tw = textW("SafeSignal", 24), tx = (SCREEN_W - tw) / 2;
+  hal_text("Safe", tx, 4, COL_WHITE, 24);
+  hal_text("Signal", tx + textW("Safe", 24), 4, 0x4DB8FF, 24);
+  hal_rect(SCREEN_W / 2 - 30, 31, 60, 2, 0x4DB8FF);                       // thin accent line under the title
   if (gGeoRisk && gGeoName) {                            // inside a danger zone: warning replaces the subtitle
     String b = String("! ") + gGeoName;
-    textCentered(b.c_str(), 34, gGeoRisk >= 4 ? COL_OFF : COL_ORANGE, 16);
-  } else textCentered("Tap how you feel", 34, COL_LGREY, 16);
-  int cs = connState();                                   // internet status, always visible under the title
+    textCentered(b.c_str(), 35, gGeoRisk >= 4 ? COL_OFF : COL_ORANGE, 16);
+  } else textCentered("Tap how you feel", 35, COL_LGREY, 16);
+  // Internet status as a centred pill:  (dot) Online / No internet / No Wi-Fi / Connecting...
+  int cs = connState();
   const char *ct = cs == 1 ? "Online" : cs == 2 ? "No internet" : cs == 3 ? "No Wi-Fi" : "Connecting...";
   uint32_t cc = cs == 1 ? COL_CONN : cs == 0 ? 0xAAAAAA : COL_OFF;
-  int cw = textW(ct, 16);
-  int cx = (SCREEN_W - (cw + 18)) / 2;
-  hal_circle(cx + 6, 62, 6, cc);
-  hal_text(ct, cx + 18, 54, cc, 16);
+  uint32_t bg = cs == 1 ? 0x0F3A1B : cs == 0 ? 0x2A2A2A : 0x4A1512;
+  int ctw = textW(ct, 16), pw = ctw + 42, px = (SCREEN_W - pw) / 2;
+  hal_circle(px + 11, 60, 11, bg);
+  hal_circle(px + pw - 11, 60, 11, bg);
+  hal_rect(px + 11, 49, pw - 22, 22, bg);
+  hal_circle(px + 17, 60, 4, cc);
+  hal_text(ct, px + 28, 52, cc, 16);
 
   int y = 78, h = 62, gap = 6;
   for (int i = 0; i < 3; i++) {
