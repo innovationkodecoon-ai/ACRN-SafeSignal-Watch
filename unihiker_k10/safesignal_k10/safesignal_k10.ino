@@ -43,6 +43,11 @@
  *   Location comes from LOCATION_SOURCE (use LOC_SERIAL_NMEA with a GPS module). Test with the keys w / a / W.
  *   The camera is NOT turned on by a geofence alert: only the caregiver can switch it on.
  *
+ * ARE YOU OK?: when the child enters a danger zone the watch shows a blinking "ARE YOU OK?" screen and keeps showing it
+ *   until the child presses B (I'M OK) or A (HELP). If there is no answer for 60 s, GEOFENCE_NO_REPLY (urgent) is sent.
+ *   The zones come from the caregiver app (ZONES_REQUEST, synced every minute and saved); the table in section 1b is the fallback.
+ *   On power-up the PAIRING screen is always shown first; an already paired watch continues to the main screen once online.
+ *
  * LOW BATTERY: sends LOW_BATTERY to the caregiver app once when the battery reaches 20% or lower
  *   (re-arms when it goes back above 20%). Needs a battery reading, see hal_batteryPercent() below.
  *
@@ -164,8 +169,9 @@ static const long GPS_BAUD  = 9600;
 //   risk 2 MEDIUM   : caregiver alerted on entering (not ACRN), reminder every 5 min
 //   risk 1 LOW      : caregiver told once on entering, no reminders
 // ---------------------------------------------------------------------
+// BUILT-IN zones (used until the caregiver app sends its own list, see ZONE SYNC below).
 struct Zone { const char *name; const char *type; double lat; double lng; uint16_t radiusM; uint8_t risk; };
-static const Zone ZONES[] = {
+static const Zone DEFAULT_ZONES[] = {
   // name                  type            lat        lng         radius  risk
   { "East Coast Beach",    "BEACH",        1.30080,   103.91220,  250,    4 },
   { "MacRitchie Reservoir","WATER",        1.34400,   103.83400,  200,    4 },
@@ -173,7 +179,23 @@ static const Zone ZONES[] = {
   { "Orchard Road",        "BUSY ROAD",    1.30480,   103.83180,  60,     3 },
   { "Building Site",       "CONSTRUCTION", 1.33000,   103.80000,  70,     2 },
 };
-static const int ZONE_COUNT = sizeof(ZONES) / sizeof(ZONES[0]);
+static const int DEFAULT_ZONE_COUNT = sizeof(DEFAULT_ZONES) / sizeof(DEFAULT_ZONES[0]);
+
+// ZONE SYNC: the danger zones the caregiver sets in the app are downloaded by the watch (ZONES_REQUEST, every minute)
+// and saved in flash, so they also work offline. The built-in list above is only used while the app has sent none.
+struct ZoneRT { char name[32]; char type[16]; double lat; double lng; uint16_t radiusM; uint8_t risk; };
+static const int      MAX_ZONES          = 24;
+static const bool     USE_BUILTIN_ZONES  = true;      // false = no built-in zones, only the caregiver's
+static const uint32_t ZONE_SYNC_MS       = 60000;
+
+// "ARE YOU OK?" screen: shown when the child enters a danger zone (risk >= this) until the child presses I'M OK (B) or HELP (A)
+static const uint8_t  ASK_OK_MIN_RISK    = 1;
+static const uint32_t ASK_ESCALATE_MS    = 60000;     // no answer for this long => GEOFENCE_NO_REPLY (urgent) to caregiver / ACRN
+
+// On power-up the PAIRING screen is shown first. If the watch is already paired it moves on to the main screen
+// after the connection is up (at least MIN, at most MAX milliseconds).
+static const uint32_t BOOT_SPLASH_MIN_MS = 3000;
+static const uint32_t BOOT_SPLASH_MAX_MS = 12000;
 
 static const uint32_t GEO_CONFIRM_FIXES   = 2;      // consecutive GPS fixes needed to confirm enter / leave (stops GPS jitter false alarms; CRITICAL needs only 1)
 static const double   GEO_LEAVE_MARGIN    = 1.15;   // must be 15% + 10 m outside the zone to count as "left"
@@ -506,6 +528,7 @@ static int pendingCount() {
 // 7. NETWORK  (runs in its own FreeRTOS task so the screen never freezes)
 // =====================================================================
 enum SendResult { R_SENT, R_QUEUED, R_DROPPED };
+static void zonesSync();                       // defined in section 8a
 
 static void setOnline(bool on) {
   int8_t prev = gOnline;
@@ -885,7 +908,7 @@ static void flushOutbox() {
 }
 
 static void networkTask(void *) {
-  uint32_t lastHb = 0, lastTry = 0, lastWifi = 0, lastRestored = 0, lastPair = 0, lastImg = 0;
+  uint32_t lastHb = 0, lastTry = 0, lastWifi = 0, lastRestored = 0, lastPair = 0, lastImg = 0, lastZones = 0;
   bool ntpStarted = false;
   for (;;) {
     uint32_t now = millis();
@@ -935,6 +958,9 @@ static void networkTask(void *) {
       if (r == R_SENT || gLastHttpCode > 0) gConnRestoredPending = false;   // done, or backend answered (even a 4xx)
     }
 
+    // Danger zones set by the caregiver in the app
+    if (gPaired && gOnline == 1 && (lastZones == 0 || now - lastZones >= ZONE_SYNC_MS)) { lastZones = now ? now : 1; zonesSync(); }
+
     // Heartbeat. An offline watch cannot report that it is offline, so Base44 treats
     // several missed beats (about 45 s) as "connectivity lost".
     bool liveFlowing = gCamActive && (now - gLastLiveOk < 8000);   // live frames already prove we are alive
@@ -977,13 +1003,145 @@ static void evalBattery() {
 // =====================================================================
 static void showOverlay(uint32_t color, const String &t, const String &l1, const String &l2, uint32_t ms);   // defined in section 9
 
+// ---- the zone list in use: the caregiver's zones from the app (synced), or the built-in list ----
+static ZoneRT gZones[MAX_ZONES];
+static int    gZoneCount = 0;
+static ZoneRT gZonesNew[MAX_ZONES];              // staging: filled by the network task, applied by loop()
+static int    gZonesNewCount = 0;
+static volatile bool gZonesNewReady = false;
+static String gZonesRaw;                         // last zone list received from the app (network task only)
+
+static void copyStr(char *dst, size_t n, const String &s) { strncpy(dst, s.c_str(), n - 1); dst[n - 1] = 0; }
+
+static bool jsonGetNum(const String &obj, const char *key, double &v) {
+  String k = String("\"") + key + "\"";
+  int i = obj.indexOf(k);
+  if (i < 0) return false;
+  i = obj.indexOf(':', i + k.length());
+  if (i < 0) return false;
+  i++;
+  while (i < (int)obj.length() && (obj[i] == ' ' || obj[i] == '\t' || obj[i] == '\n' || obj[i] == '\r')) i++;
+  if (i >= (int)obj.length()) return false;
+  char c = obj[i];
+  if (!(c == '-' || c == '.' || (c >= '0' && c <= '9'))) return false;
+  v = obj.substring(i).toDouble();
+  return true;
+}
+static bool jsonIsFalse(const String &obj, const char *key) {
+  int i = obj.indexOf(String("\"") + key + "\"");
+  if (i < 0) return false;
+  i = obj.indexOf(':', i);
+  if (i < 0) return false;
+  while (++i < (int)obj.length() && (obj[i] == ' ' || obj[i] == '\t')) {}
+  return obj.substring(i, i + 5) == "false";
+}
+static int riskFromText(String t) {
+  t.toUpperCase();
+  if (t.startsWith("CRIT")) return 4;
+  if (t.startsWith("HIGH")) return 3;
+  if (t.startsWith("MED")) return 2;
+  if (t.startsWith("LOW")) return 1;
+  return 3;
+}
+
+// {"zones":[{"name":"East Coast Beach","type":"BEACH","latitude":1.3,"longitude":103.9,"radiusMeters":250,"riskScore":4}, ...]}
+// Accepted keys: name|zoneName, type|zoneType, latitude|lat, longitude|lng|lon, radiusMeters|radiusM|radius,
+// riskScore|risk (1-4) or riskLevel ("LOW".."CRITICAL"), active:false = skipped.
+static bool parseZones(const String &body, ZoneRT *out, int &n) {
+  n = 0;
+  int k = body.indexOf("\"zones\"");
+  if (k < 0) return false;
+  int a = body.indexOf('[', k);
+  if (a < 0) return false;
+  int e = body.indexOf(']', a);
+  if (e < 0) return false;
+  int pos = a;
+  while (n < MAX_ZONES) {
+    int o = body.indexOf('{', pos);
+    if (o < 0 || o > e) break;
+    int c = body.indexOf('}', o);
+    if (c < 0) break;
+    String obj = body.substring(o, c + 1);
+    pos = c + 1;
+    if (jsonIsFalse(obj, "active")) continue;
+    String name = jsonGetString(obj, "name"); if (name == "") name = jsonGetString(obj, "zoneName");
+    String type = jsonGetString(obj, "type"); if (type == "") type = jsonGetString(obj, "zoneType");
+    double la = 0, lo = 0, r = 0, rk = 0;
+    bool okLa = jsonGetNum(obj, "latitude", la) || jsonGetNum(obj, "lat", la);
+    bool okLo = jsonGetNum(obj, "longitude", lo) || jsonGetNum(obj, "lng", lo) || jsonGetNum(obj, "lon", lo);
+    bool okR  = jsonGetNum(obj, "radiusMeters", r) || jsonGetNum(obj, "radiusM", r) || jsonGetNum(obj, "radius", r);
+    if (name == "" || !okLa || !okLo || !okR || r <= 0) continue;
+    int risk = 3;
+    if (jsonGetNum(obj, "riskScore", rk) || jsonGetNum(obj, "risk", rk) || jsonGetNum(obj, "riskLevel", rk)) risk = (int)rk;
+    else { String t = jsonGetString(obj, "riskLevel"); if (t == "") t = jsonGetString(obj, "risk"); if (t != "") risk = riskFromText(t); }
+    if (risk < 1) risk = 1;
+    if (risk > 4) risk = 4;
+    ZoneRT &Z = out[n++];
+    copyStr(Z.name, sizeof(Z.name), name);
+    copyStr(Z.type, sizeof(Z.type), type == "" ? String("ZONE") : type);
+    Z.lat = la; Z.lng = lo; Z.radiusM = (uint16_t)(r > 65000 ? 65000 : r); Z.risk = (uint8_t)risk;
+  }
+  return true;
+}
+
+// Boot: the zones the app sent last time (saved in flash), otherwise the built-in list.
+static void loadZones() {
+  String saved = prefs.getString("zonesJson", "");
+  int n = 0;
+  if (saved.length() >= 2 && parseZones(String("{\"zones\":") + saved + "}", gZones, n)) {
+    gZoneCount = n; gZonesRaw = saved;
+    Serial.printf("[SafeSignal] %d danger zone(s) loaded from the caregiver app (saved)\n", n);
+    return;
+  }
+  gZoneCount = 0;
+  if (USE_BUILTIN_ZONES) {
+    for (int i = 0; i < DEFAULT_ZONE_COUNT && i < MAX_ZONES; i++) {
+      const Zone &D = DEFAULT_ZONES[i]; ZoneRT &Z = gZones[gZoneCount++];
+      copyStr(Z.name, sizeof(Z.name), D.name); copyStr(Z.type, sizeof(Z.type), D.type);
+      Z.lat = D.lat; Z.lng = D.lng; Z.radiusM = D.radiusM; Z.risk = D.risk;
+    }
+  }
+  Serial.printf("[SafeSignal] %d built-in danger zone(s) (the app has not sent any yet)\n", gZoneCount);
+}
+
+// Network task: ask the app for the caregiver's zones. Reply must contain "zones":[...]
+static void zonesSync() {
+  int code; String resp;
+  if (!doPost(buildEventPayload("ZONES_REQUEST", ""), code, resp)) return;
+  static int lastCode = -1;
+  if (code != lastCode) { lastCode = code; Serial.printf("[SafeSignal] zone sync -> HTTP %d %s\n", code, resp.substring(0, 160).c_str()); }
+  if (code < 200 || code >= 300) return;
+  static ZoneRT tmp[MAX_ZONES];
+  int n = 0;
+  if (!parseZones(resp, tmp, n)) return;               // the app sent no zone list: keep what we have
+  int a = resp.indexOf('[', resp.indexOf("\"zones\"")), e = resp.indexOf(']', a);
+  String raw = resp.substring(a, e + 1);
+  if (raw == gZonesRaw) return;                        // unchanged
+  if (n == 0 && raw.length() > 2) { Serial.println("[SafeSignal] zone sync: could not read the zones (check name / latitude / longitude / radiusMeters / riskScore)"); return; }
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  memcpy(gZonesNew, tmp, sizeof(ZoneRT) * n);
+  gZonesNewCount = n; gZonesNewReady = true;
+  if (raw.length() < 3500) prefs.putString("zonesJson", raw);
+  xSemaphoreGive(gMutex);
+  gZonesRaw = raw;
+  Serial.printf("[SafeSignal] zone sync: %d danger zone(s) received from the caregiver app\n", n);
+}
+
 enum GeoState : uint8_t { GS_OUTSIDE = 0, GS_APPROACH = 1, GS_INSIDE = 2 };
-static GeoState gGeoState[ZONE_COUNT];
-static uint8_t  gGeoPend[ZONE_COUNT];            // consecutive fixes disagreeing with the current state
-static uint32_t gGeoEnteredAt[ZONE_COUNT];       // millis() when the child entered
-static uint32_t gGeoLastAlert[ZONE_COUNT];       // millis() of the last ENTER / reminder
-static uint16_t gGeoRepeats[ZONE_COUNT];
+static GeoState gGeoState[MAX_ZONES];
+static uint8_t  gGeoPend[MAX_ZONES];             // consecutive fixes disagreeing with the current state
+static uint32_t gGeoEnteredAt[MAX_ZONES];        // millis() when the child entered
+static uint32_t gGeoLastAlert[MAX_ZONES];        // millis() of the last ENTER / reminder
+static uint16_t gGeoRepeats[MAX_ZONES];
 static bool     gGeoFirstFix = true;
+static char     gGeoNameBuf[32];
+
+// "ARE YOU OK?" state
+static bool     gAsk = false;
+static uint8_t  gAskRisk = 0;
+static char     gAskName[32];
+static uint32_t gAskSince = 0;
+static bool     gAskEscalated = false;
 
 static const char *riskName(int r) { return r >= 4 ? "CRITICAL" : r == 3 ? "HIGH" : r == 2 ? "MEDIUM" : "LOW"; }
 static bool     riskNotifiesAcrn(int r) { return r >= 3; }                                   // HIGH and CRITICAL go to ACRN
@@ -999,38 +1157,70 @@ static double distanceM(double la1, double lo1, double la2, double lo2) {
   return 2 * R * asin(sqrt(a));
 }
 
-// Sends GEOFENCE_APPROACHING / GEOFENCE_ENTER / GEOFENCE_STILL_INSIDE / GEOFENCE_EXIT to Base44.
+// Sends GEOFENCE_APPROACHING / ENTER / STILL_INSIDE / NO_REPLY / CHILD_OK / CHILD_HELP / EXIT to Base44.
 static void geoSend(const char *eventType, int z, const Fix &f, double dist) {
-  const Zone &Z = ZONES[z];
-  bool acrn = (strcmp(eventType, "GEOFENCE_EXIT") == 0 || strcmp(eventType, "GEOFENCE_APPROACHING") == 0) ? false : riskNotifiesAcrn(Z.risk);
+  const ZoneRT &Z = gZones[z];
+  bool enterLike = strcmp(eventType, "GEOFENCE_ENTER") == 0 || strcmp(eventType, "GEOFENCE_STILL_INSIDE") == 0;
+  bool noReply = strcmp(eventType, "GEOFENCE_NO_REPLY") == 0;
+  bool acrn = enterLike ? riskNotifiesAcrn(Z.risk) : noReply ? (Z.risk >= 2) : false;
   String x = String(",\"zoneName\":\"") + Z.name + "\",\"zoneType\":\"" + Z.type + "\"";
   x += String(",\"riskLevel\":\"") + riskName(Z.risk) + "\",\"riskScore\":" + String((int)Z.risk);
   x += ",\"distanceMeters\":" + String((int)(dist + 0.5)) + ",\"radiusMeters\":" + String((int)Z.radiusM);
   x += ",\"zoneLatitude\":" + jnum(true, Z.lat) + ",\"zoneLongitude\":" + jnum(true, Z.lng);
   x += ",\"latitude\":" + jnum(f.ok, f.lat) + ",\"longitude\":" + jnum(f.ok, f.lng);
   x += String(",\"notifyCaregiver\":true,\"notifyACRN\":") + (acrn ? "true" : "false");
-  x += String(",\"urgent\":") + ((acrn && Z.risk >= 4) ? "true" : "false");
+  x += String(",\"urgent\":") + (((acrn && Z.risk >= 4) || noReply) ? "true" : "false");
+  x += String(",\"awaitingChildReply\":") + (gAsk ? "true" : "false");
   if (gGeoEnteredAt[z]) x += ",\"secondsInside\":" + String((int)((millis() - gGeoEnteredAt[z]) / 1000));
   x += ",\"repeatCount\":" + String((int)gGeoRepeats[z]);
   if (gBattery >= 0) x += ",\"batteryLevel\":" + String((int)gBattery);
   submit(SLOT_GEO, buildEventPayload(eventType, x));
 }
 
-// Full-screen warning for the child. Colour follows the risk.
+// Full-screen warning for the child (used when the "ARE YOU OK?" screen is not showing). Colour follows the risk.
 static void geoWarnScreen(int z, bool reminder) {
   if (gAwaitingPress) return;                              // do not hide the "Sending..." of a button press
-  const Zone &Z = ZONES[z];
+  const ZoneRT &Z = gZones[z];
   uint32_t col = Z.risk >= 4 ? COL_RED : Z.risk == 3 ? 0xE04A00 : Z.risk == 2 ? COL_ORANGE : COL_BLUE;
   const char *title = Z.risk >= 4 ? "DANGER!" : Z.risk == 3 ? "Be careful!" : "Careful";
   const char *l2 = Z.risk >= 3 ? "Caregiver and helpers were told. Stay here." : "Your caregiver was told.";
   showOverlay(col, title, String("You are at ") + Z.name, l2, reminder ? 4000 : 9000);
 }
 
+// New zone list from the app: swap it in (loop thread only), keeping the state of zones that did not change.
+static void applyNewZones() {
+  if (!gZonesNewReady) return;
+  static ZoneRT nz[MAX_ZONES], oz[MAX_ZONES];
+  int nn;
+  xSemaphoreTake(gMutex, portMAX_DELAY);
+  nn = gZonesNewCount;
+  memcpy(nz, gZonesNew, sizeof(ZoneRT) * nn);
+  gZonesNewReady = false;
+  xSemaphoreGive(gMutex);
+
+  int on = gZoneCount;
+  memcpy(oz, gZones, sizeof(ZoneRT) * on);
+  GeoState st[MAX_ZONES]; uint8_t pe[MAX_ZONES]; uint32_t en[MAX_ZONES], la[MAX_ZONES]; uint16_t rp[MAX_ZONES];
+  memcpy(st, gGeoState, sizeof(st)); memcpy(pe, gGeoPend, sizeof(pe));
+  memcpy(en, gGeoEnteredAt, sizeof(en)); memcpy(la, gGeoLastAlert, sizeof(la)); memcpy(rp, gGeoRepeats, sizeof(rp));
+  memset(gGeoState, 0, sizeof(gGeoState)); memset(gGeoPend, 0, sizeof(gGeoPend));
+  memset(gGeoEnteredAt, 0, sizeof(gGeoEnteredAt)); memset(gGeoLastAlert, 0, sizeof(gGeoLastAlert)); memset(gGeoRepeats, 0, sizeof(gGeoRepeats));
+  for (int i = 0; i < nn; i++) {
+    gZones[i] = nz[i];
+    for (int j = 0; j < on; j++) {
+      if (strcmp(nz[i].name, oz[j].name) == 0) { gGeoState[i] = st[j]; gGeoPend[i] = pe[j]; gGeoEnteredAt[i] = en[j]; gGeoLastAlert[i] = la[j]; gGeoRepeats[i] = rp[j]; break; }
+    }
+  }
+  gZoneCount = nn;
+  Serial.printf("[SafeSignal] now using %d danger zone(s) from the caregiver app\n", nn);
+}
+
 static void geoTick(const Fix &f) {
+  applyNewZones();
   if (!f.ok) return;
   uint32_t now = millis();
-  for (int z = 0; z < ZONE_COUNT; z++) {
-    const Zone &Z = ZONES[z];
+  for (int z = 0; z < gZoneCount; z++) {
+    const ZoneRT &Z = gZones[z];
     double d = distanceM(f.lat, f.lng, Z.lat, Z.lng);
     double rIn = Z.radiusM, rApp = Z.radiusM + riskApproachM(Z.risk);
     GeoState cur = gGeoState[z], want;
@@ -1049,7 +1239,7 @@ static void geoTick(const Fix &f) {
           gGeoLastAlert[z] = now; gGeoRepeats[z]++;
           Serial.printf("[SafeSignal] GEOFENCE reminder: still inside %s (risk %s)\n", Z.name, riskName(Z.risk));
           geoSend("GEOFENCE_STILL_INSIDE", z, f, d);
-          geoWarnScreen(z, true);
+          if (!gAsk) geoWarnScreen(z, true);
         }
       }
       continue;
@@ -1062,24 +1252,45 @@ static void geoTick(const Fix &f) {
     if (want == GS_INSIDE) {
       gGeoEnteredAt[z] = now ? now : 1; gGeoLastAlert[z] = now; gGeoRepeats[z] = 0;
       Serial.printf("[SafeSignal] GEOFENCE ENTER: %s (%s) risk %s, %d m from centre\n", Z.name, Z.type, riskName(Z.risk), (int)d);
+      if (Z.risk >= ASK_OK_MIN_RISK) {                      // "ARE YOU OK?" until the child answers
+        if (!gAsk) { gAsk = true; gAskSince = now ? now : 1; gAskEscalated = false; gAskRisk = 0; }
+        if (Z.risk > gAskRisk) { gAskRisk = Z.risk; copyStr(gAskName, sizeof(gAskName), Z.name); }
+        gDirty = true;
+      }
       geoSend("GEOFENCE_ENTER", z, f, d);
-      geoWarnScreen(z, false);
+      if (!gAsk) geoWarnScreen(z, false);
     } else if (cur == GS_INSIDE) {
       Serial.printf("[SafeSignal] GEOFENCE EXIT: %s\n", Z.name);
       geoSend("GEOFENCE_EXIT", z, f, d);
       gGeoEnteredAt[z] = 0;
-      showOverlay(COL_GREEN, "Safe again", String("You left ") + Z.name, "", 3000);
+      if (!gAsk) showOverlay(COL_GREEN, "Safe again", String("You left ") + Z.name, "", 3000);
     } else if (want == GS_APPROACH) {
       Serial.printf("[SafeSignal] GEOFENCE APPROACHING: %s, %d m away\n", Z.name, (int)d);
       geoSend("GEOFENCE_APPROACHING", z, f, d);
-      if (!gAwaitingPress) showOverlay(COL_ORANGE, "Careful", String("Danger area ahead: ") + Z.name, "Please turn back", 5000);
+      if (!gAwaitingPress && !gAsk) showOverlay(COL_ORANGE, "Careful", String("Danger area ahead: ") + Z.name, "Please turn back", 5000);
     }
   }
   gGeoFirstFix = false;
-  // highest-risk zone the child is inside right now (drives the red banner on the main screen)
+  // highest-risk zone the child is inside right now (drives the banner on the main screen)
   uint8_t top = 0; const char *nm = nullptr;
-  for (int z = 0; z < ZONE_COUNT; z++) if (gGeoState[z] == GS_INSIDE && ZONES[z].risk > top) { top = ZONES[z].risk; nm = ZONES[z].name; }
-  if (top != gGeoRisk || nm != gGeoName) { gGeoRisk = top; gGeoName = nm; gDirty = true; }
+  for (int z = 0; z < gZoneCount; z++) if (gGeoState[z] == GS_INSIDE && gZones[z].risk > top) { top = gZones[z].risk; nm = gZones[z].name; }
+  if (top != gGeoRisk || (top && strcmp(nm, gGeoNameBuf) != 0)) {
+    if (top) { strncpy(gGeoNameBuf, nm, sizeof(gGeoNameBuf) - 1); gGeoNameBuf[sizeof(gGeoNameBuf) - 1] = 0; }
+    gGeoName = top ? gGeoNameBuf : nullptr; gGeoRisk = top; gDirty = true;
+  }
+}
+
+// If the child does not answer "ARE YOU OK?" for ASK_ESCALATE_MS, tell the caregiver / ACRN urgently (once).
+static void askTick() {
+  if (!gAsk || gAskEscalated) return;
+  if (millis() - gAskSince < ASK_ESCALATE_MS) return;
+  gAskEscalated = true;
+  for (int z = 0; z < gZoneCount; z++) if (strcmp(gZones[z].name, gAskName) == 0) {
+    Fix f = getFix();
+    Serial.printf("[SafeSignal] GEOFENCE NO REPLY: the child did not answer ARE YOU OK? in %s\n", gAskName);
+    geoSend("GEOFENCE_NO_REPLY", z, f, f.ok ? distanceM(f.lat, f.lng, gZones[z].lat, gZones[z].lng) : 0);
+    break;
+  }
 }
 
 static void gpsTick() {
@@ -1220,7 +1431,7 @@ static void showOverlay(uint32_t color, const String &t, const String &l1, const
 
 // Live view is on while the camera session runs, unless a message / the buttons screen is showing.
 static bool previewWanted() {
-  return CAMERA_LIVE_PREVIEW && gCamActive && !gOneShot && gMode == MODE_MAIN && !gOverlay && (int32_t)(millis() - gButtonsUntil) >= 0;
+  return CAMERA_LIVE_PREVIEW && gCamActive && !gOneShot && gMode == MODE_MAIN && !gOverlay && !gAsk && (int32_t)(millis() - gButtonsUntil) >= 0;
 }
 
 // Live camera picture is drawn by the K10 behind the canvas; we only add two small text bars.
@@ -1294,17 +1505,25 @@ static void drawPairing() {
   hal_clear();
   textCentered("SafeSignal", 4, COL_WHITE, 24);
   textCentered("Connect your device", 34, COL_LGREY, 16);
-  textCentered(gOnline == 1 ? "Waiting for caregiver..." : "Connecting...", 54, gOnline == 1 ? COL_CONN : COL_OFF, 16);
+  if (gPaired) textCentered(gOnline == 1 ? "Paired - Online" : "Paired - Connecting...", 54, gOnline == 1 ? COL_CONN : 0xAAAAAA, 16);
+  else textCentered(gOnline == 1 ? "Waiting for caregiver..." : "Connecting...", 54, gOnline == 1 ? COL_CONN : COL_OFF, 16);
 
   textCentered("Device ID", 80, COL_LGREY, 16);
   textCentered(DEVICE_ID, 100, COL_WHITE, 24);
 
   textCentered("Pairing Code", 138, COL_LGREY, 16);
-  hal_rect(8, 158, SCREEN_W - 16, 52, COL_BLUE);
+  hal_rect(8, 158, SCREEN_W - 16, 52, gPaired ? COL_GREEN : COL_BLUE);
   char spaced[16];                                       // "482 731" with extra spacing
   snprintf(spaced, sizeof(spaced), "%c %c %c   %c %c %c", gPairCode[0], gPairCode[1], gPairCode[2], gPairCode[3], gPairCode[4], gPairCode[5]);
   textCentered(spaced, 172, COL_WHITE, 24);
 
+  if (gPaired) {
+    textCentered(gChildName.length() ? (String("Linked to ") + gChildName).c_str() : "Linked to caregiver", 224, COL_WHITE, 16);
+    textCentered("Starting...", 244, COL_LGREY, 16);
+    hal_text("B: continue", 14, 296, COL_LGREY, 16);
+    hal_present();
+    return;
+  }
   textCentered("Type both in the app", 224, COL_WHITE, 16);
   if (!USE_FIXED_PAIR_CODE) {
     int left = (int)((PAIR_CODE_LIFE_MS - (millis() - gPairCodeAt)) / 1000);
@@ -1318,6 +1537,22 @@ static void drawPairing() {
   else snprintf(sv, sizeof(sv), "Server error %d", gPairHttp);
   textCentered(sv, 268, (gPairHttp >= 200 && gPairHttp < 300) ? COL_CONN : COL_OFF, 16);
   hal_text(USE_FIXED_PAIR_CODE ? "B: skip for now" : "A:new code  B:skip", 14, 296, COL_LGREY, 16);
+  hal_present();
+}
+
+// "ARE YOU OK?" - shown after the child enters a danger zone, until the child answers (B = I'M OK, A = HELP)
+static void drawAsk() {
+  bool flash = ((millis() / 1000) & 1) == 0;             // top block blinks to get attention
+  hal_clear();
+  hal_rect(0, 0, SCREEN_W, 130, flash ? COL_RED : 0x8A1010);
+  textCentered("ARE YOU OK?", 14, COL_WHITE, 24);
+  textWrapped(String("You are at ") + gAskName, 52, COL_WHITE, 16);
+  textCentered("Danger area", 106, 0xFFD0D0, 16);
+  hal_rect(8, 140, SCREEN_W - 16, 64, COL_GREEN);
+  textCentered("B: I'M OK", 140 + 20, COL_WHITE, 24);
+  hal_rect(8, 214, SCREEN_W - 16, 64, 0xA01818);
+  textCentered("A: HELP", 214 + 20, COL_WHITE, 24);
+  textCentered("Your caregiver was told", 290, COL_LGREY, 16);
   hal_present();
 }
 
@@ -1341,6 +1576,19 @@ static void pressChoice(int idx) {
   gAwaitingPress = true; gAwaitingSince = millis();
   showOverlay(CHOICES[idx].color, "Sending...", "", "", 12000);
   if (LIVE_ON_PRESS) camStart(CHOICES[idx].status);   // live camera on (+ a saved photo of this moment)
+}
+
+// The child answers "ARE YOU OK?":  idx 0 = I'M OK, 2 = HELP. Sends the normal status AND a geofence reply.
+static void answerAsk(int idx) {
+  for (int z = 0; z < gZoneCount; z++) if (strcmp(gZones[z].name, gAskName) == 0) {
+    Fix f = getFix();
+    gAsk = false;                                        // so the reply is not marked "awaiting"
+    geoSend(idx == 0 ? "GEOFENCE_CHILD_OK" : "GEOFENCE_CHILD_HELP", z, f, f.ok ? distanceM(f.lat, f.lng, gZones[z].lat, gZones[z].lng) : 0);
+    break;
+  }
+  gAsk = false; gAskEscalated = false; gAskRisk = 0;
+  gOverlay = false; gCooldownUntil = 0; gSel = idx; gDirty = true;
+  pressChoice(idx);
 }
 
 static void handleUiEvents() {
@@ -1380,8 +1628,10 @@ static void handleUiEvents() {
 static int gSimZone = -1;
 // mode 0 = at the centre of the next zone, 1 = just outside its edge (inside the early-warning ring)
 static void simZone(int mode) {
-  if (mode == 0 || gSimZone < 0) gSimZone = (gSimZone + 1) % ZONE_COUNT;
-  const Zone &Z = ZONES[gSimZone];
+  if (gZoneCount == 0) { Serial.println("DEV: no danger zones loaded"); return; }
+  if (mode == 0 || gSimZone < 0) gSimZone = (gSimZone + 1) % gZoneCount;
+  if (gSimZone >= gZoneCount) gSimZone = 0;
+  const ZoneRT &Z = gZones[gSimZone];
   double offM = mode == 0 ? 0 : Z.radiusM + (riskApproachM(Z.risk) ? riskApproachM(Z.risk) / 2 : 15);
   SIM.fLat = Z.lat + offM / 111320.0; SIM.fLng = Z.lng; SIM.fake = true;
   Serial.printf("DEV: pretending to be %s %s (%s, risk %s)\n", mode == 0 ? "INSIDE" : "just outside", Z.name, Z.type, riskName(Z.risk));
@@ -1420,7 +1670,7 @@ static void devCommands() {
 // 11. setup() / loop()
 // =====================================================================
 static bool gPrevA = false, gPrevB = false;
-static uint32_t gBothSince = 0, gLastPairDraw = 0, gLastLiveDraw = 0;
+static uint32_t gBothSince = 0, gLastPairDraw = 0, gLastLiveDraw = 0, gLastAskDraw = 0, gBootAt = 0;
 static int8_t gDrawnOnline = -2, gDrawnGps = -2; static int gDrawnConn = -2; static int gDrawnBatt = -2;
 
 void setup() {
@@ -1434,7 +1684,8 @@ void setup() {
   gChildId = gPaired ? prefs.getString("childId", CHILD_ID) : String(CHILD_ID);
   gChildName = prefs.getString("childName", "");
   gDeviceToken = gPaired ? prefs.getString("token", "") : String("");
-  if (!gPaired) { newPairCode(); gMode = MODE_PAIRING; }   // new watch: show the pairing code first
+  newPairCode(); gMode = MODE_PAIRING; gBootAt = millis();   // ALWAYS start on the pairing screen (paired watches move on by themselves)
+  loadZones();                                         // danger zones: from the app (saved) or built-in
 
   hal_init();
   if (LOCATION_SOURCE == LOC_SERIAL_NMEA) Serial1.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -1464,7 +1715,11 @@ void loop() {
 
   // Buttons (act on the press edge)
   bool a = hal_buttonA(), b = hal_buttonB();
-  if (gMode == MODE_PAIRING) {
+  if (gAsk) {                                                            // "ARE YOU OK?" has priority over everything
+    if (b && !gPrevB) answerAsk(0);                                      // B = I'M OK
+    else if (a && !gPrevA) answerAsk(2);                                 // A = HELP
+  } else if (gMode == MODE_PAIRING) {
+    if (gPaired && ((gOnline == 1 && now - gBootAt >= BOOT_SPLASH_MIN_MS) || now - gBootAt >= BOOT_SPLASH_MAX_MS)) { gMode = MODE_MAIN; gDirty = true; }   // paired: on to the main screen
     if (a && !gPrevA && !gOverlay && !USE_FIXED_PAIR_CODE) { newPairCode(); gDirty = true; }   // A = new code
     if (b && !gPrevB && !gOverlay) { gMode = MODE_MAIN; gDirty = true; }        // B = skip for now
     if (now - gLastPairDraw >= 1000) { gLastPairDraw = now; if (!gOverlay) gDirty = true; }   // countdown
@@ -1485,6 +1740,8 @@ void loop() {
 
   handleUiEvents();
   camTick();
+  askTick();
+  if (gAsk && now - gLastAskDraw >= 1000) { gLastAskDraw = now; gDirty = true; }   // blinking
 
   if (gAwaitingPress && now - gAwaitingSince > REQUEST_TIMEOUT_MS + 4000) {   // network task never answered
     gAwaitingPress = false;
@@ -1504,7 +1761,7 @@ void loop() {
   if (gPreviewOn && now - gLastLiveDraw >= 1500) { gLastLiveDraw = now; gDirty = true; }   // refresh the delivery counter
   if (gDirty) {
     gDirty = false;
-    if (gOverlay) drawOverlay(); else if (gMode == MODE_PAIRING) drawPairing(); else if (gPreviewOn) drawLive(); else drawMain();
+    if (gAsk) drawAsk(); else if (gOverlay) drawOverlay(); else if (gMode == MODE_PAIRING) drawPairing(); else if (gPreviewOn) drawLive(); else drawMain();
   }
   delay(20);
 }
